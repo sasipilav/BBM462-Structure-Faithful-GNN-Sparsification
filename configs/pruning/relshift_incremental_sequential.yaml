@@ -1,0 +1,9 @@
+method: relshift
+rho: 0.05
+score_mode: relative
+d_min: 2
+guard_bridges: true
+backend: orca
+eps: 1.0e-8
+relshift_engine: incremental_sequential_exact
+use_score_cache: true

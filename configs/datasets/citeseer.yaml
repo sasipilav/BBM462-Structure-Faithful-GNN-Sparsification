@@ -1,0 +1,4 @@
+name: citeseer
+root: data/raw
+make_undirected: true
+preserve_splits: true

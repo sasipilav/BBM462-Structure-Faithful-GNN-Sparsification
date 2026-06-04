@@ -1,0 +1,8 @@
+name: graphsage
+hidden_dim: 128
+num_layers: 2
+dropout: 0.5
+lr: 0.01
+weight_decay: 0.0005
+epochs: 300
+early_stop: 50

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+.DS_Store
+data/raw/
+data/processed/
+data/cached_gdv/
+results/
+tmp/
+venv/
+.venv/
+results.zip
+results-csv/

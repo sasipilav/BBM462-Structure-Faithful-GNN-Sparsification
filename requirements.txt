@@ -1,0 +1,11 @@
+torch>=2.1
+torch-geometric>=2.5
+networkx>=3.2
+numpy>=1.26
+pandas>=2.2
+PyYAML>=6.0
+scikit-learn>=1.4
+matplotlib>=3.8
+scipy>=1.12
+pytest>=8.0
+ninja>=1.11
