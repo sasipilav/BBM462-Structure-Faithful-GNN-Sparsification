@@ -264,3 +264,62 @@ The runtime profiler now also records scale-sensitive work that may be small on 
 - candidate-delta and total known edge-state memory projections at 1M, 10M, and 60M edges.
 
 `active_edge_list_rebuild_runtime_sec` is retained for before/after compatibility and is zero on the immutable active-mask path.
+
+## Phase 1 step 3: exact versioned heap and safe lazy deletion
+
+The exact sequential engine can select candidates through either:
+
+```yaml
+incremental_selection_backend: linear_scan
+```
+
+or:
+
+```yaml
+incremental_selection_backend: versioned_heap
+heap_rebuild_ratio: 4.0
+```
+
+Ready-to-run configurations are provided in:
+
+- `configs/pruning/relshift_incremental_heap.yaml`
+- `configs/pruning/relshift_incremental_heap_profile.yaml`
+
+The versioned heap preserves the complete reference comparison key:
+
+```text
+(RelShift score, endpoint degree tie-break, triangle-support tie-break, stable edge ID)
+```
+
+Only obsolete heap records are deleted lazily. Score recomputation is not deferred until pop time. Whenever an edge score or tie-break value may have changed, that edge is immediately marked dirty, its version is incremented, and its new exact key is computed before the next selection. This prevents a decreased stale score from being hidden below an incorrect old heap key.
+
+Bridge and minimum-degree exclusions are maintained as permanent guard states. This is exact in the deletion-only process because an active bridge cannot become non-bridge after further edge deletions, and node degrees cannot increase. The native Tarjan bridge pass is still executed each round to discover newly created bridges; Step 3 does not solve the global bridge-maintenance cost.
+
+The heap uses deterministic rebuilding to bound stale-record growth. A rebuild is triggered when the heap contains more than 1,024 entries and exceeds `heap_rebuild_ratio * eligible_active_edges`. The default ratio `4.0` is a speed-memory compromise; larger ratios reduce rebuild frequency but increase heap memory.
+
+Run a direct exact comparison:
+
+```bash
+python scripts/compare_relshift_selection_backends.py \
+  --dataset configs/datasets/cora.yaml \
+  --pruning configs/pruning/relshift_incremental_profile.yaml \
+  --rho 0.10 \
+  --warmup-runs 1 \
+  --repeats 3 \
+  --heap-rebuild-ratio 4.0 \
+  --output-root results/relshift_heap_comparison/cora_rho_010
+```
+
+The script alternates the two backends in one process, asserts deterministic within-backend output, and fails if their complete removed-edge sequences differ.
+
+Additional profiler fields include:
+
+- dirty edge entries scanned;
+- heap keys pushed;
+- heap update and pop times;
+- stale, inactive, guarded, and dirty records popped;
+- rebuild count and rebuild edge-ID scans;
+- current and maximum heap size;
+- heap auxiliary-state and rebuild-bound memory projections.
+
+Validated Cora results and the exactness argument are documented in `docs/phase1_step3_versioned_heap.md` and `docs/phase1_step3_validation.json`.

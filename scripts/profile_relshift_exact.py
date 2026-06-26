@@ -173,6 +173,7 @@ def _summary_row(run_index: int, summary: dict[str, object]) -> dict[str, object
     memory = dict(summary.get("memory", {}))
     cache = dict(summary.get("cache_behavior", {}))
     scaling = dict(summary.get("scaling_work", {}))
+    selection = dict(summary.get("selection_backend", {}))
     return {
         "run": run_index,
         "dataset": dict(summary.get("dataset", {})).get("name"),
@@ -189,11 +190,17 @@ def _summary_row(run_index: int, summary: dict[str, object]) -> dict[str, object
         "native_score_runtime_sec": timings.get("native_score_runtime_sec"),
         "native_scalar_refresh_runtime_sec": timings.get("native_scalar_refresh_runtime_sec"),
         "best_selection_runtime_sec": timings.get("best_selection_runtime_sec"),
+        "heap_update_runtime_sec": timings.get("heap_update_runtime_sec"),
+        "heap_pop_runtime_sec": timings.get("heap_pop_runtime_sec"),
         "selected_update_runtime_sec": timings.get("selected_update_runtime_sec"),
         "native_graph_edge_removal_runtime_sec": timings.get("native_graph_edge_removal_runtime_sec"),
         "active_edge_list_rebuild_runtime_sec": timings.get("active_edge_list_rebuild_runtime_sec"),
         "total_active_edge_id_entries_scanned": scaling.get("total_active_edge_id_entries_scanned"),
         "total_inactive_edge_ids_skipped": scaling.get("total_inactive_edge_ids_skipped"),
+        "total_dirty_edge_entries_scanned": scaling.get("total_dirty_edge_entries_scanned"),
+        "total_heap_rebuild_edge_entries_scanned": scaling.get(
+            "total_heap_rebuild_edge_entries_scanned"
+        ),
         "total_bridge_adjacency_entries_visited": scaling.get("total_bridge_adjacency_entries_visited"),
         "total_bridge_inactive_adjacency_entries_skipped": scaling.get(
             "total_bridge_inactive_adjacency_entries_skipped"
@@ -209,6 +216,13 @@ def _summary_row(run_index: int, summary: dict[str, object]) -> dict[str, object
         "known_edge_state_gib_at_1m_edges": memory.get("known_edge_state_gib_at_1m_edges"),
         "known_edge_state_gib_at_10m_edges": memory.get("known_edge_state_gib_at_10m_edges"),
         "known_edge_state_gib_at_60m_edges": memory.get("known_edge_state_gib_at_60m_edges"),
+        "incremental_selection_backend": selection.get("incremental_selection_backend"),
+        "heap_max_size_observed": selection.get("heap_max_size_observed"),
+        "heap_rebuild_count_total": selection.get("heap_rebuild_count_total"),
+        "heap_rebuild_edge_entries_scanned_total": selection.get(
+            "heap_rebuild_edge_entries_scanned_total"
+        ),
+        "heap_max_estimated_bytes": selection.get("heap_max_estimated_bytes"),
     }
 
 

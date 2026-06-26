@@ -73,6 +73,16 @@ def relshift_prune(
     profile_label = str((config.options or {}).get("profile_label", "")).strip()
     peak_rss_start_mb = _peak_rss_mb() if profile_memory else None
     use_native_graph_state = bool((config.options or {}).get("use_native_graph_state", True))
+    incremental_selection_backend = str(
+        (config.options or {}).get("incremental_selection_backend", "linear_scan")
+    ).strip().lower()
+    if incremental_selection_backend not in {"linear_scan", "versioned_heap"}:
+        raise ValueError(
+            "incremental_selection_backend must be one of: linear_scan, versioned_heap."
+        )
+    heap_rebuild_ratio = float((config.options or {}).get("heap_rebuild_ratio", 4.0))
+    if heap_rebuild_ratio < 1.0:
+        raise ValueError("heap_rebuild_ratio must be at least 1.0.")
     profile_native_kernel = bool((config.options or {}).get("profile_native_kernel", False))
     native_omp_threads = int((config.options or {}).get("native_omp_threads", 0) or 0)
     if native_omp_threads < 0:
@@ -155,6 +165,13 @@ def relshift_prune(
         initial_native_graph_state_runtime_sec = float(time.perf_counter() - timer)
     if candidate_delta_cache_enabled and native_graph_state is None:
         raise RuntimeError("mixed-correction candidate delta cache requires persistent native graph state.")
+    use_versioned_heap = bool(
+        fast_incremental_default and incremental_selection_backend == "versioned_heap"
+    )
+    if use_versioned_heap and native_graph_state is None:
+        raise RuntimeError("versioned_heap selection requires persistent NativeGraphState.")
+    if use_versioned_heap and not use_score_cache:
+        raise RuntimeError("versioned_heap selection requires use_score_cache=true.")
     invalidation_marks = np.zeros(len(edge_by_id), dtype=np.uint32)
     invalidation_epoch = 1
     pruning_state_initialization_runtime_sec = float(time.perf_counter() - state_initialization_start)
@@ -217,22 +234,83 @@ def relshift_prune(
                 timer = time.perf_counter()
                 prebuilt_csr = _adjacency_to_csr(current_adjacency)
                 prebuilt_csr_runtime_sec = float(time.perf_counter() - timer)
-            guard_result = _eligible_edge_id_partitions_incremental_native(
-                row_ptr=None if prebuilt_csr is None else prebuilt_csr[0],
-                col_idx=None if prebuilt_csr is None else prebuilt_csr[1],
-                active_edge_ids=round_edge_ids,
-                edge_array_by_id=edge_array_by_id,
-                degrees=degrees,
-                d_min=config.d_min,
-                guard_bridges=config.guard_bridges,
-                valid_score_cache=valid_score_cache,
-                delta_valid_cache=delta_valid_cache if candidate_delta_cache_enabled else None,
-                use_score_cache=use_score_cache,
-                native_graph_state=native_graph_state,
-                score_cache_values=score_cache_values,
-                degree_score_cache_values=degree_score_cache_values,
-                support_score_cache_values=support_score_cache_values,
-            )
+            if use_versioned_heap:
+                heap_guard_start = time.perf_counter()
+                raw_guard_result = native_graph_state.prepare_versioned_heap_round(
+                    int(config.d_min),
+                    bool(config.guard_bridges),
+                    valid_score_cache,
+                    delta_valid_cache if candidate_delta_cache_enabled else None,
+                )
+                guard_result = {
+                    "eligible_edge_ids": [],
+                    "rescored_edge_ids": [
+                        int(edge_id)
+                        for edge_id in np.asarray(
+                            raw_guard_result["rescored_edge_ids"], dtype=np.int64
+                        ).tolist()
+                    ],
+                    "reused_edge_ids": [],
+                    "refresh_edge_ids": [
+                        int(edge_id)
+                        for edge_id in np.asarray(
+                            raw_guard_result["refresh_edge_ids"], dtype=np.int64
+                        ).tolist()
+                    ],
+                    "eligible_count": int(raw_guard_result["eligible_count"]),
+                    "rescored_count": int(raw_guard_result["rescored_count"]),
+                    "reused_count": int(raw_guard_result["reused_count"]),
+                    "refresh_count": int(raw_guard_result["refresh_count"]),
+                    "blocked_by_bridge_count": int(raw_guard_result["blocked_by_bridge_count"]),
+                    "blocked_by_d_min_count": int(raw_guard_result["blocked_by_d_min_count"]),
+                    "bridge_count": int(raw_guard_result.get("bridge_count", 0)),
+                    "bridge_runtime_sec": float(raw_guard_result["bridge_runtime_sec"]),
+                    "bridge_nodes_visited": int(raw_guard_result.get("bridge_nodes_visited", 0)),
+                    "bridge_adjacency_entries_visited": int(
+                        raw_guard_result.get("bridge_adjacency_entries_visited", 0)
+                    ),
+                    "bridge_inactive_adjacency_entries_skipped": int(
+                        raw_guard_result.get("bridge_inactive_adjacency_entries_skipped", 0)
+                    ),
+                    "eligibility_runtime_sec": float(raw_guard_result["eligibility_runtime_sec"]),
+                    "active_edge_id_entries_scanned": int(
+                        raw_guard_result.get("active_edge_id_entries_scanned", 0)
+                    ),
+                    "inactive_edge_ids_skipped": int(
+                        raw_guard_result.get("inactive_edge_ids_skipped", 0)
+                    ),
+                    "dirty_edge_entries_scanned": int(
+                        raw_guard_result.get("dirty_edge_entries_scanned", 0)
+                    ),
+                    "dirty_inactive_or_guarded_skipped": int(
+                        raw_guard_result.get("dirty_inactive_or_guarded_skipped", 0)
+                    ),
+                    "heap_size_before_update": int(
+                        raw_guard_result.get("heap_size_before_update", 0)
+                    ),
+                    "cache_partition_runtime_sec": 0.0,
+                    "cached_best_edge_id": -1,
+                    "heap_guard_wrapper_runtime_sec": float(
+                        time.perf_counter() - heap_guard_start
+                    ),
+                }
+            else:
+                guard_result = _eligible_edge_id_partitions_incremental_native(
+                    row_ptr=None if prebuilt_csr is None else prebuilt_csr[0],
+                    col_idx=None if prebuilt_csr is None else prebuilt_csr[1],
+                    active_edge_ids=round_edge_ids,
+                    edge_array_by_id=edge_array_by_id,
+                    degrees=degrees,
+                    d_min=config.d_min,
+                    guard_bridges=config.guard_bridges,
+                    valid_score_cache=valid_score_cache,
+                    delta_valid_cache=delta_valid_cache if candidate_delta_cache_enabled else None,
+                    use_score_cache=use_score_cache,
+                    native_graph_state=native_graph_state,
+                    score_cache_values=score_cache_values,
+                    degree_score_cache_values=degree_score_cache_values,
+                    support_score_cache_values=support_score_cache_values,
+                )
             eligible_edge_ids = guard_result["eligible_edge_ids"]
             native_rescored_edge_ids = guard_result["rescored_edge_ids"]
             native_reused_edge_ids = guard_result["reused_edge_ids"]
@@ -257,6 +335,14 @@ def relshift_prune(
                 guard_result.get("active_edge_id_entries_scanned", len(round_edge_ids))
             )
             round_profile["inactive_edge_ids_skipped"] = int(guard_result.get("inactive_edge_ids_skipped", 0))
+            round_profile["dirty_edge_entries_scanned"] = int(guard_result.get("dirty_edge_entries_scanned", 0))
+            round_profile["dirty_inactive_or_guarded_skipped"] = int(
+                guard_result.get("dirty_inactive_or_guarded_skipped", 0)
+            )
+            round_profile["heap_size_before_update"] = int(guard_result.get("heap_size_before_update", 0))
+            round_profile["heap_guard_wrapper_runtime_sec"] = float(
+                guard_result.get("heap_guard_wrapper_runtime_sec", 0.0)
+            )
             round_profile["score_csr_runtime_sec"] = prebuilt_csr_runtime_sec
             round_profile["cache_partition_runtime_sec"] = float(guard_result.get("cache_partition_runtime_sec", 0.0))
             if native_graph_state is not None and hasattr(native_graph_state, "storage_statistics"):
@@ -439,28 +525,76 @@ def relshift_prune(
             else:
                 _relshift_log(verbose, f"[relshift] round={round_idx} rescored=0 reused={reused_score_count} native_score_sec=0.0000")
             best_selection_start = time.perf_counter()
-            if native_cached_best_edge_id >= 0:
-                cached_best_edge_id = native_cached_best_edge_id
+            if use_versioned_heap:
+                heap_commit_result = native_graph_state.commit_dirty_heap_keys(
+                    score_cache_values,
+                    degree_score_cache_values,
+                    support_score_cache_values,
+                    valid_score_cache,
+                    float(heap_rebuild_ratio),
+                )
+                heap_pop_result = native_graph_state.pop_best_versioned_heap()
+                selected_edge_id_raw = int(heap_pop_result.get("selected_edge_id", -1))
+                selected_edge_id = selected_edge_id_raw if selected_edge_id_raw >= 0 else None
+                round_profile["heap_update_runtime_sec"] = float(
+                    heap_commit_result.get("heap_update_runtime_sec", 0.0)
+                )
+                round_profile["heap_pop_runtime_sec"] = float(
+                    heap_pop_result.get("heap_pop_runtime_sec", 0.0)
+                )
+                round_profile["heap_keys_pushed"] = int(
+                    heap_commit_result.get("heap_keys_pushed", 0)
+                )
+                round_profile["heap_rebuilt"] = int(
+                    bool(heap_commit_result.get("heap_rebuilt", False))
+                )
+                round_profile["heap_rebuild_edge_entries_scanned"] = int(
+                    heap_commit_result.get("heap_rebuild_edge_entries_scanned", 0)
+                )
+                round_profile["heap_size_after_update"] = int(
+                    heap_commit_result.get("heap_size_after_update", 0)
+                )
+                round_profile["heap_size_after_pop"] = int(
+                    heap_pop_result.get("heap_size_after_pop", 0)
+                )
+                round_profile["heap_entries_popped"] = int(
+                    heap_pop_result.get("heap_entries_popped", 0)
+                )
+                round_profile["heap_stale_entries_popped"] = int(
+                    heap_pop_result.get("heap_stale_entries_popped", 0)
+                )
+                round_profile["heap_inactive_entries_popped"] = int(
+                    heap_pop_result.get("heap_inactive_entries_popped", 0)
+                )
+                round_profile["heap_guard_entries_popped"] = int(
+                    heap_pop_result.get("heap_guard_entries_popped", 0)
+                )
+                round_profile["heap_dirty_entries_popped"] = int(
+                    heap_pop_result.get("heap_dirty_entries_popped", 0)
+                )
             else:
-                cached_best_edge_id = _best_cached_edge_id(
-                    reused_edge_ids,
+                if native_cached_best_edge_id >= 0:
+                    cached_best_edge_id = native_cached_best_edge_id
+                else:
+                    cached_best_edge_id = _best_cached_edge_id(
+                        reused_edge_ids,
+                        score_cache_values=score_cache_values,
+                        degree_score_cache_values=degree_score_cache_values,
+                        support_score_cache_values=support_score_cache_values,
+                    )
+                selected_edge_id = _merge_best_edge_ids(
+                    cached_best_edge_id,
+                    _merge_best_edge_ids(
+                        refreshed_best_edge_id,
+                        rescored_best_edge_id,
+                        score_cache_values=score_cache_values,
+                        degree_score_cache_values=degree_score_cache_values,
+                        support_score_cache_values=support_score_cache_values,
+                    ),
                     score_cache_values=score_cache_values,
                     degree_score_cache_values=degree_score_cache_values,
                     support_score_cache_values=support_score_cache_values,
                 )
-            selected_edge_id = _merge_best_edge_ids(
-                cached_best_edge_id,
-                _merge_best_edge_ids(
-                    refreshed_best_edge_id,
-                    rescored_best_edge_id,
-                    score_cache_values=score_cache_values,
-                    degree_score_cache_values=degree_score_cache_values,
-                    support_score_cache_values=support_score_cache_values,
-                ),
-                score_cache_values=score_cache_values,
-                degree_score_cache_values=degree_score_cache_values,
-                support_score_cache_values=support_score_cache_values,
-            )
             if selected_edge_id is None:
                 raise RuntimeError("Incremental RelShift could not select an edge from non-empty eligible set.")
             selected_edge = edge_by_id[selected_edge_id]
@@ -808,6 +942,11 @@ def relshift_prune(
         active_edge_mask=active_edge_mask,
         all_edge_ids=all_edge_ids,
     )
+    final_heap_stats = (
+        dict(native_graph_state.versioned_heap_statistics())
+        if use_versioned_heap and native_graph_state is not None
+        else {}
+    )
     runtime_summary = _build_runtime_summary(
         bundle=bundle,
         config=config,
@@ -833,6 +972,33 @@ def relshift_prune(
         native_openmp_info=native_openmp_info,
         profile_native_kernel=profile_native_kernel,
     )
+    heap_entry_size_bytes = float(final_heap_stats.get("heap_entry_size_bytes", 0.0))
+    heap_auxiliary_bytes_per_edge = (
+        float(final_heap_stats.get("heap_auxiliary_state_bytes", 0.0)) / max(bundle.num_edges, 1)
+        if use_versioned_heap
+        else 0.0
+    )
+    heap_bound_bytes_per_edge = (
+        heap_rebuild_ratio * heap_entry_size_bytes + heap_auxiliary_bytes_per_edge
+        if use_versioned_heap
+        else 0.0
+    )
+    runtime_summary["selection_backend"] = {
+        "incremental_selection_backend": incremental_selection_backend,
+        "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap else None,
+        "heap_auxiliary_bytes_per_edge": heap_auxiliary_bytes_per_edge if use_versioned_heap else None,
+        "heap_rebuild_bound_bytes_per_edge": heap_bound_bytes_per_edge if use_versioned_heap else None,
+        "heap_rebuild_bound_gib_at_1m_edges": (
+            heap_bound_bytes_per_edge * 1_000_000 / (1024.0**3) if use_versioned_heap else None
+        ),
+        "heap_rebuild_bound_gib_at_10m_edges": (
+            heap_bound_bytes_per_edge * 10_000_000 / (1024.0**3) if use_versioned_heap else None
+        ),
+        "heap_rebuild_bound_gib_at_60m_edges": (
+            heap_bound_bytes_per_edge * 60_000_000 / (1024.0**3) if use_versioned_heap else None
+        ),
+        **final_heap_stats,
+    }
     runtime_summary_path: Path | None = None
     runtime_by_round_path: Path | None = None
     runtime_profile_write_runtime_sec = 0.0
@@ -879,6 +1045,9 @@ def relshift_prune(
             "runtime_profile_write_runtime_sec": runtime_profile_write_runtime_sec,
             "runtime_profile": runtime_summary if write_runtime_profile else None,
             "use_native_graph_state": use_native_graph_state,
+            "incremental_selection_backend": incremental_selection_backend,
+            "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap else None,
+            "versioned_heap_statistics": final_heap_stats if use_versioned_heap else None,
             "profile_native_kernel": profile_native_kernel,
             "native_omp_threads_requested": native_omp_threads,
             "candidate_delta_cache_mode": candidate_delta_cache_mode,
@@ -895,9 +1064,17 @@ def relshift_prune(
             "cache_partition_mode": "native_eligibility_valid_score_split" if is_incremental_sequential and not write_edge_scores else "python_score_cache_split",
             "cache_invalidation_mode": "native_or_boolean_state_changed_incident_plus_delta_impacted" if is_incremental_sequential else "batch_original_region_and_local_neighbors",
             "native_kernel_version": _native_kernel_version(native_kernel_variant) if is_incremental_sequential else "",
-            "native_selection_mode": "native_best_with_array_cache" if is_incremental_sequential and not write_edge_scores else "materialized_edge_scores",
-            "native_guard_mode": "native_tarjan_eligibility" if is_incremental_sequential and not write_edge_scores else "python_guard_loop",
-            "native_graph_state_mode": "persistent_dynamic_csr" if native_graph_state is not None else "per_round_python_csr",
+            "native_selection_mode": (
+                "versioned_heap_exact" if use_versioned_heap
+                else "native_best_with_array_cache" if is_incremental_sequential and not write_edge_scores
+                else "materialized_edge_scores"
+            ),
+            "native_guard_mode": (
+                "native_tarjan_monotone_guard_state" if use_versioned_heap
+                else "native_tarjan_eligibility" if is_incremental_sequential and not write_edge_scores
+                else "python_guard_loop"
+            ),
+            "native_graph_state_mode": "persistent_immutable_csr_active_mask" if native_graph_state is not None else "per_round_python_csr",
             "csr_reuse_mode": "persistent_native_graph_state" if native_graph_state is not None else "shared_round_csr" if is_incremental_sequential and not write_edge_scores else "per_operation_csr",
             "configuration_setup_runtime_sec": configuration_setup_runtime_sec,
             "extension_setup_runtime_sec": extension_setup_runtime_sec,
@@ -2009,6 +2186,9 @@ def _build_runtime_summary(
         "native_delta_accumulation_runtime_sec",
         "native_score_scalarization_runtime_sec",
         "native_scalar_refresh_runtime_sec",
+        "heap_guard_wrapper_runtime_sec",
+        "heap_update_runtime_sec",
+        "heap_pop_runtime_sec",
         "best_selection_runtime_sec",
         "selected_update_runtime_sec",
         "selected_delta_runtime_sec",
@@ -2031,6 +2211,16 @@ def _build_runtime_summary(
         "blocked_by_d_min_count",
         "active_edge_id_entries_scanned",
         "inactive_edge_ids_skipped",
+        "dirty_edge_entries_scanned",
+        "dirty_inactive_or_guarded_skipped",
+        "heap_keys_pushed",
+        "heap_entries_popped",
+        "heap_stale_entries_popped",
+        "heap_inactive_entries_popped",
+        "heap_guard_entries_popped",
+        "heap_dirty_entries_popped",
+        "heap_rebuilt",
+        "heap_rebuild_edge_entries_scanned",
         "bridge_nodes_visited",
         "bridge_adjacency_entries_visited",
         "bridge_inactive_adjacency_entries_skipped",
@@ -2146,6 +2336,14 @@ def _build_runtime_summary(
         "scaling_work": {
             "total_active_edge_id_entries_scanned": totals["active_edge_id_entries_scanned"],
             "total_inactive_edge_ids_skipped": totals["inactive_edge_ids_skipped"],
+            "total_dirty_edge_entries_scanned": totals["dirty_edge_entries_scanned"],
+            "total_heap_keys_pushed": totals["heap_keys_pushed"],
+            "total_heap_entries_popped": totals["heap_entries_popped"],
+            "total_heap_stale_entries_popped": totals["heap_stale_entries_popped"],
+            "total_heap_guard_entries_popped": totals["heap_guard_entries_popped"],
+            "total_heap_rebuild_edge_entries_scanned": totals[
+                "heap_rebuild_edge_entries_scanned"
+            ],
             "total_bridge_nodes_visited": totals["bridge_nodes_visited"],
             "total_bridge_adjacency_entries_visited": totals["bridge_adjacency_entries_visited"],
             "total_bridge_inactive_adjacency_entries_skipped": totals[
@@ -2224,6 +2422,19 @@ def _write_runtime_profile_artifacts(
         "bridge_inactive_adjacency_entries_skipped",
         "active_edge_id_entries_scanned",
         "inactive_edge_ids_skipped",
+        "dirty_edge_entries_scanned",
+        "dirty_inactive_or_guarded_skipped",
+        "heap_size_before_update",
+        "heap_keys_pushed",
+        "heap_rebuilt",
+        "heap_rebuild_edge_entries_scanned",
+        "heap_size_after_update",
+        "heap_entries_popped",
+        "heap_stale_entries_popped",
+        "heap_inactive_entries_popped",
+        "heap_guard_entries_popped",
+        "heap_dirty_entries_popped",
+        "heap_size_after_pop",
         "immutable_directed_adjacency_entries",
         "active_directed_adjacency_entries",
         "inactive_directed_adjacency_entries",
@@ -2245,6 +2456,9 @@ def _write_runtime_profile_artifacts(
         "eligibility_runtime_sec",
         "native_score_runtime_sec",
         "native_scalar_refresh_runtime_sec",
+        "heap_guard_wrapper_runtime_sec",
+        "heap_update_runtime_sec",
+        "heap_pop_runtime_sec",
         "best_selection_runtime_sec",
         "selected_update_runtime_sec",
         "selected_delta_runtime_sec",

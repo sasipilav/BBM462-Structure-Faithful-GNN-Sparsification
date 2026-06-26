@@ -16,3 +16,4 @@ results-csv/
 report/
 tests/
 docs/
+pytest.ini

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -217,6 +218,23 @@ inline bool edge_key_less(const EdgeKey& left, const EdgeKey& right) {
     }
     return left.edge_id < right.edge_id;
 }
+
+struct VersionedHeapEntry {
+    EdgeKey key;
+    uint64_t version;
+};
+
+struct VersionedHeapGreater {
+    bool operator()(const VersionedHeapEntry& left, const VersionedHeapEntry& right) const {
+        if (edge_key_less(right.key, left.key)) {
+            return true;
+        }
+        if (edge_key_less(left.key, right.key)) {
+            return false;
+        }
+        return left.version > right.version;
+    }
+};
 
 void collect_attached_nodes(
     const int64_t* row_ptr,
@@ -1655,6 +1673,27 @@ public:
         }
         original_edge_count_ = static_cast<int64_t>(edge_by_id_.size());
         active_edge_count_ = original_edge_count_;
+        heap_versions_.assign(static_cast<size_t>(original_edge_count_), 0);
+        heap_dirty_mask_.assign(static_cast<size_t>(original_edge_count_), static_cast<uint8_t>(0));
+        guard_reason_.assign(static_cast<size_t>(original_edge_count_), static_cast<uint8_t>(0));
+        heap_dirty_edge_ids_.clear();
+        selection_heap_ = decltype(selection_heap_)();
+        heap_initialized_ = false;
+        heap_guard_configuration_initialized_ = false;
+        heap_d_min_ = -1;
+        heap_guard_bridges_ = false;
+        eligible_active_count_ = 0;
+        bridge_blocked_count_ = 0;
+        d_min_blocked_count_ = 0;
+        heap_push_count_total_ = 0;
+        heap_pop_count_total_ = 0;
+        heap_stale_pop_count_total_ = 0;
+        heap_inactive_pop_count_total_ = 0;
+        heap_guard_pop_count_total_ = 0;
+        heap_dirty_pop_count_total_ = 0;
+        heap_rebuild_count_total_ = 0;
+        heap_rebuild_edge_entries_scanned_total_ = 0;
+        heap_max_size_observed_ = 0;
         has_edge_ids_ = true;
     }
 
@@ -1884,6 +1923,372 @@ public:
         result["inactive_edge_ids_skipped"] = inactive_edge_ids_skipped;
         result["cache_partition_runtime_sec"] = 0.0;
         result["cached_best_edge_id"] = static_cast<int64_t>(has_cached_best ? cached_best.edge_id : -1);
+        return result;
+    }
+
+    py::dict prepare_versioned_heap_round(
+        const int d_min,
+        const bool guard_bridges,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array,
+        py::object delta_valid_cache_object = py::none()
+    ) {
+        if (!has_edge_ids_) {
+            throw std::runtime_error("Versioned heap requires stable edge id state.");
+        }
+        if (valid_score_cache_array.ndim() != 1 || valid_score_cache_array.shape(0) != original_edge_count_) {
+            throw std::runtime_error("valid_score_cache must have one entry per original edge.");
+        }
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> delta_valid_cache_array;
+        const uint8_t* delta_valid_cache_ptr = nullptr;
+        ssize_t delta_valid_cache_size = 0;
+        if (!delta_valid_cache_object.is_none()) {
+            delta_valid_cache_array = delta_valid_cache_object.cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>();
+            if (delta_valid_cache_array.ndim() != 1 || delta_valid_cache_array.shape(0) != original_edge_count_) {
+                throw std::runtime_error("delta_valid_cache must have one entry per original edge.");
+            }
+            delta_valid_cache_ptr = static_cast<const uint8_t*>(delta_valid_cache_array.data());
+            delta_valid_cache_size = delta_valid_cache_array.shape(0);
+        }
+        if (!heap_guard_configuration_initialized_) {
+            heap_d_min_ = d_min;
+            heap_guard_bridges_ = guard_bridges;
+            heap_guard_configuration_initialized_ = true;
+        } else if (heap_d_min_ != d_min || heap_guard_bridges_ != guard_bridges) {
+            throw std::runtime_error("Versioned heap guard configuration cannot change during pruning.");
+        }
+
+        using Clock = std::chrono::high_resolution_clock;
+        const auto bridge_start = Clock::now();
+        std::unordered_set<uint64_t> bridge_codes;
+        int64_t bridge_nodes_visited = 0;
+        int64_t bridge_adjacency_entries_visited = 0;
+        int64_t bridge_inactive_adjacency_entries_skipped = 0;
+        if (guard_bridges) {
+            std::vector<int> discovery(static_cast<size_t>(num_nodes_), -1);
+            std::vector<int> low(static_cast<size_t>(num_nodes_), 0);
+            std::vector<int> parent(static_cast<size_t>(num_nodes_), -1);
+            int visit_time = 0;
+            bridge_codes.reserve(static_cast<size_t>(active_edge_count_ / 8 + 1));
+            std::function<void(int)> visit = [&](const int node) {
+                ++bridge_nodes_visited;
+                discovery[static_cast<size_t>(node)] = visit_time;
+                low[static_cast<size_t>(node)] = visit_time;
+                ++visit_time;
+                for (
+                    int64_t idx = row_ptr_[static_cast<size_t>(node)];
+                    idx < row_ptr_[static_cast<size_t>(node + 1)];
+                    ++idx
+                ) {
+                    ++bridge_adjacency_entries_visited;
+                    if (!adjacency_entry_is_active(idx, adjacency_edge_ids_.data(), active_edge_mask_.data())) {
+                        ++bridge_inactive_adjacency_entries_skipped;
+                        continue;
+                    }
+                    const int neighbor = static_cast<int>(col_idx_[static_cast<size_t>(idx)]);
+                    if (discovery[static_cast<size_t>(neighbor)] == -1) {
+                        parent[static_cast<size_t>(neighbor)] = node;
+                        visit(neighbor);
+                        low[static_cast<size_t>(node)] = std::min(
+                            low[static_cast<size_t>(node)],
+                            low[static_cast<size_t>(neighbor)]
+                        );
+                        if (low[static_cast<size_t>(neighbor)] > discovery[static_cast<size_t>(node)]) {
+                            bridge_codes.insert(encode_pair(node, neighbor));
+                        }
+                    } else if (neighbor != parent[static_cast<size_t>(node)]) {
+                        low[static_cast<size_t>(node)] = std::min(
+                            low[static_cast<size_t>(node)],
+                            discovery[static_cast<size_t>(neighbor)]
+                        );
+                    }
+                }
+            };
+            for (int node = 0; node < num_nodes_; ++node) {
+                if (discovery[static_cast<size_t>(node)] == -1) {
+                    visit(node);
+                }
+            }
+        }
+        const double bridge_runtime_sec = std::chrono::duration<double>(Clock::now() - bridge_start).count();
+
+        const auto eligibility_start = Clock::now();
+        if (!heap_initialized_) {
+            eligible_active_count_ = active_edge_count_;
+            for (const uint64_t bridge_code : bridge_codes) {
+                const auto found = edge_code_to_id_.find(bridge_code);
+                if (found != edge_code_to_id_.end()) {
+                    mark_heap_guard_reason(found->second, static_cast<uint8_t>(2));
+                }
+            }
+            for (int node = 0; node < num_nodes_; ++node) {
+                if (current_degrees_[static_cast<size_t>(node)] <= d_min) {
+                    for (const int64_t edge_id : incident_edge_ids_[static_cast<size_t>(node)]) {
+                        mark_heap_guard_reason(edge_id, static_cast<uint8_t>(1));
+                    }
+                }
+            }
+            heap_initialized_ = true;
+            for (int64_t edge_id = 0; edge_id < original_edge_count_; ++edge_id) {
+                if (
+                    active_edge_mask_[static_cast<size_t>(edge_id)] != 0 &&
+                    guard_reason_[static_cast<size_t>(edge_id)] == 0
+                ) {
+                    mark_heap_dirty(edge_id);
+                }
+            }
+        } else {
+            for (const uint64_t bridge_code : bridge_codes) {
+                const auto found = edge_code_to_id_.find(bridge_code);
+                if (found != edge_code_to_id_.end()) {
+                    mark_heap_guard_reason(found->second, static_cast<uint8_t>(2));
+                }
+            }
+        }
+
+        const auto valid_score_cache = valid_score_cache_array.unchecked<1>();
+        std::vector<int64_t> rescored_ids;
+        std::vector<int64_t> refresh_ids;
+        rescored_ids.reserve(heap_dirty_edge_ids_.size());
+        refresh_ids.reserve(heap_dirty_edge_ids_.size());
+        int64_t dirty_entries_scanned = 0;
+        int64_t dirty_inactive_or_guarded_skipped = 0;
+        for (const int64_t edge_id : heap_dirty_edge_ids_) {
+            ++dirty_entries_scanned;
+            if (edge_id < 0 || edge_id >= original_edge_count_) {
+                throw std::runtime_error("Internal dirty edge id is out of range.");
+            }
+            if (heap_dirty_mask_[static_cast<size_t>(edge_id)] == 0) {
+                continue;
+            }
+            if (
+                active_edge_mask_[static_cast<size_t>(edge_id)] == 0 ||
+                guard_reason_[static_cast<size_t>(edge_id)] != 0
+            ) {
+                heap_dirty_mask_[static_cast<size_t>(edge_id)] = 0;
+                ++dirty_inactive_or_guarded_skipped;
+                continue;
+            }
+            (void)valid_score_cache;
+            if (
+                delta_valid_cache_ptr != nullptr &&
+                edge_id < delta_valid_cache_size &&
+                delta_valid_cache_ptr[edge_id] != 0
+            ) {
+                refresh_ids.push_back(edge_id);
+            } else {
+                rescored_ids.push_back(edge_id);
+            }
+        }
+        const int64_t dirty_candidate_count = static_cast<int64_t>(rescored_ids.size() + refresh_ids.size());
+        const int64_t reused_count = std::max<int64_t>(0, eligible_active_count_ - dirty_candidate_count);
+        const double eligibility_runtime_sec = std::chrono::duration<double>(Clock::now() - eligibility_start).count();
+
+        auto to_array = [](const std::vector<int64_t>& values) {
+            py::array_t<int64_t> array(static_cast<ssize_t>(values.size()));
+            auto view = array.mutable_unchecked<1>();
+            for (size_t idx = 0; idx < values.size(); ++idx) {
+                view(static_cast<ssize_t>(idx)) = values[idx];
+            }
+            return array;
+        };
+
+        py::dict result;
+        result["rescored_edge_ids"] = to_array(rescored_ids);
+        result["refresh_edge_ids"] = to_array(refresh_ids);
+        result["eligible_count"] = eligible_active_count_;
+        result["rescored_count"] = static_cast<int64_t>(rescored_ids.size());
+        result["refresh_count"] = static_cast<int64_t>(refresh_ids.size());
+        result["reused_count"] = reused_count;
+        result["blocked_by_bridge_count"] = bridge_blocked_count_;
+        result["blocked_by_d_min_count"] = d_min_blocked_count_;
+        result["bridge_count"] = static_cast<int64_t>(bridge_codes.size());
+        result["bridge_runtime_sec"] = bridge_runtime_sec;
+        result["bridge_nodes_visited"] = bridge_nodes_visited;
+        result["bridge_adjacency_entries_visited"] = bridge_adjacency_entries_visited;
+        result["bridge_inactive_adjacency_entries_skipped"] = bridge_inactive_adjacency_entries_skipped;
+        result["eligibility_runtime_sec"] = eligibility_runtime_sec;
+        result["active_edge_id_entries_scanned"] = static_cast<int64_t>(0);
+        result["inactive_edge_ids_skipped"] = static_cast<int64_t>(0);
+        result["dirty_edge_entries_scanned"] = dirty_entries_scanned;
+        result["dirty_inactive_or_guarded_skipped"] = dirty_inactive_or_guarded_skipped;
+        result["heap_size_before_update"] = static_cast<int64_t>(selection_heap_.size());
+        return result;
+    }
+
+    py::dict commit_dirty_heap_keys(
+        py::array_t<double, py::array::c_style | py::array::forcecast> score_cache_array,
+        py::array_t<double, py::array::c_style | py::array::forcecast> degree_score_cache_array,
+        py::array_t<double, py::array::c_style | py::array::forcecast> support_score_cache_array,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array,
+        const double rebuild_ratio = 4.0
+    ) {
+        if (!heap_initialized_) {
+            throw std::runtime_error("Versioned heap has not been prepared.");
+        }
+        if (rebuild_ratio < 1.0) {
+            throw std::runtime_error("heap rebuild ratio must be at least 1.0.");
+        }
+        const auto score_cache = score_cache_array.unchecked<1>();
+        const auto degree_score_cache = degree_score_cache_array.unchecked<1>();
+        const auto support_score_cache = support_score_cache_array.unchecked<1>();
+        const auto valid_score_cache = valid_score_cache_array.unchecked<1>();
+        using Clock = std::chrono::high_resolution_clock;
+        const auto start = Clock::now();
+        int64_t pushed_count = 0;
+        int64_t cleared_blocked_count = 0;
+        for (const int64_t edge_id : heap_dirty_edge_ids_) {
+            if (edge_id < 0 || edge_id >= original_edge_count_) {
+                throw std::runtime_error("Internal dirty edge id is out of range during heap commit.");
+            }
+            if (heap_dirty_mask_[static_cast<size_t>(edge_id)] == 0) {
+                continue;
+            }
+            if (
+                active_edge_mask_[static_cast<size_t>(edge_id)] == 0 ||
+                guard_reason_[static_cast<size_t>(edge_id)] != 0
+            ) {
+                heap_dirty_mask_[static_cast<size_t>(edge_id)] = 0;
+                ++cleared_blocked_count;
+                continue;
+            }
+            if (valid_score_cache(edge_id) == 0) {
+                throw std::runtime_error("Dirty eligible edge was not refreshed before heap commit.");
+            }
+            const EdgeKey key{
+                score_cache(edge_id),
+                degree_score_cache(edge_id),
+                support_score_cache(edge_id),
+                edge_id,
+            };
+            selection_heap_.push(VersionedHeapEntry{key, heap_versions_[static_cast<size_t>(edge_id)]});
+            ++heap_push_count_total_;
+            ++pushed_count;
+            heap_dirty_mask_[static_cast<size_t>(edge_id)] = 0;
+        }
+        heap_dirty_edge_ids_.clear();
+        heap_max_size_observed_ = std::max<int64_t>(
+            heap_max_size_observed_,
+            static_cast<int64_t>(selection_heap_.size())
+        );
+
+        bool rebuilt = false;
+        const int64_t rebuild_scan_count_before = heap_rebuild_edge_entries_scanned_total_;
+        const int64_t rebuild_floor = 1024;
+        const double rebuild_limit = rebuild_ratio * static_cast<double>(std::max<int64_t>(eligible_active_count_, 1));
+        if (
+            static_cast<int64_t>(selection_heap_.size()) > rebuild_floor &&
+            static_cast<double>(selection_heap_.size()) > rebuild_limit
+        ) {
+            rebuild_selection_heap(score_cache, degree_score_cache, support_score_cache, valid_score_cache);
+            rebuilt = true;
+        }
+        const double runtime_sec = std::chrono::duration<double>(Clock::now() - start).count();
+        py::dict result;
+        result["heap_update_runtime_sec"] = runtime_sec;
+        result["heap_keys_pushed"] = pushed_count;
+        result["heap_dirty_blocked_cleared"] = cleared_blocked_count;
+        result["heap_rebuilt"] = rebuilt;
+        result["heap_rebuild_edge_entries_scanned"] =
+            heap_rebuild_edge_entries_scanned_total_ - rebuild_scan_count_before;
+        result["heap_size_after_update"] = static_cast<int64_t>(selection_heap_.size());
+        result["heap_max_size_observed"] = heap_max_size_observed_;
+        return result;
+    }
+
+    py::dict pop_best_versioned_heap() {
+        if (!heap_initialized_) {
+            throw std::runtime_error("Versioned heap has not been initialized.");
+        }
+        using Clock = std::chrono::high_resolution_clock;
+        const auto start = Clock::now();
+        int64_t popped_count = 0;
+        int64_t stale_popped = 0;
+        int64_t inactive_popped = 0;
+        int64_t guard_popped = 0;
+        int64_t dirty_popped = 0;
+        int64_t selected_edge_id = -1;
+        EdgeKey selected_key{0.0, 0.0, 0.0, -1};
+        while (!selection_heap_.empty()) {
+            const VersionedHeapEntry entry = selection_heap_.top();
+            selection_heap_.pop();
+            ++popped_count;
+            ++heap_pop_count_total_;
+            const int64_t edge_id = entry.key.edge_id;
+            if (edge_id < 0 || edge_id >= original_edge_count_) {
+                ++stale_popped;
+                ++heap_stale_pop_count_total_;
+                continue;
+            }
+            if (active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
+                ++inactive_popped;
+                ++heap_inactive_pop_count_total_;
+                continue;
+            }
+            if (guard_reason_[static_cast<size_t>(edge_id)] != 0) {
+                ++guard_popped;
+                ++heap_guard_pop_count_total_;
+                continue;
+            }
+            if (heap_dirty_mask_[static_cast<size_t>(edge_id)] != 0) {
+                ++dirty_popped;
+                ++heap_dirty_pop_count_total_;
+                continue;
+            }
+            if (entry.version != heap_versions_[static_cast<size_t>(edge_id)]) {
+                ++stale_popped;
+                ++heap_stale_pop_count_total_;
+                continue;
+            }
+            selected_edge_id = edge_id;
+            selected_key = entry.key;
+            break;
+        }
+        const double runtime_sec = std::chrono::duration<double>(Clock::now() - start).count();
+        py::dict result;
+        result["selected_edge_id"] = selected_edge_id;
+        result["best_score"] = selected_edge_id >= 0 ? selected_key.score : std::numeric_limits<double>::infinity();
+        result["best_degree_score"] = selected_edge_id >= 0 ? selected_key.degree_score : std::numeric_limits<double>::infinity();
+        result["best_support_score"] = selected_edge_id >= 0 ? selected_key.support_score : std::numeric_limits<double>::infinity();
+        result["heap_pop_runtime_sec"] = runtime_sec;
+        result["heap_entries_popped"] = popped_count;
+        result["heap_stale_entries_popped"] = stale_popped;
+        result["heap_inactive_entries_popped"] = inactive_popped;
+        result["heap_guard_entries_popped"] = guard_popped;
+        result["heap_dirty_entries_popped"] = dirty_popped;
+        result["heap_size_after_pop"] = static_cast<int64_t>(selection_heap_.size());
+        return result;
+    }
+
+    py::dict versioned_heap_statistics() const {
+        int64_t dirty_count = 0;
+        for (const uint8_t value : heap_dirty_mask_) {
+            dirty_count += value != 0 ? 1 : 0;
+        }
+        py::dict result;
+        result["heap_initialized"] = heap_initialized_;
+        result["heap_size"] = static_cast<int64_t>(selection_heap_.size());
+        result["heap_max_size_observed"] = heap_max_size_observed_;
+        result["heap_dirty_edge_count"] = dirty_count;
+        result["eligible_active_count"] = eligible_active_count_;
+        result["bridge_blocked_count"] = bridge_blocked_count_;
+        result["d_min_blocked_count"] = d_min_blocked_count_;
+        result["heap_push_count_total"] = heap_push_count_total_;
+        result["heap_pop_count_total"] = heap_pop_count_total_;
+        result["heap_stale_pop_count_total"] = heap_stale_pop_count_total_;
+        result["heap_inactive_pop_count_total"] = heap_inactive_pop_count_total_;
+        result["heap_guard_pop_count_total"] = heap_guard_pop_count_total_;
+        result["heap_dirty_pop_count_total"] = heap_dirty_pop_count_total_;
+        result["heap_rebuild_count_total"] = heap_rebuild_count_total_;
+        result["heap_rebuild_edge_entries_scanned_total"] = heap_rebuild_edge_entries_scanned_total_;
+        result["heap_entry_size_bytes"] = static_cast<int64_t>(sizeof(VersionedHeapEntry));
+        result["heap_current_estimated_bytes"] = static_cast<int64_t>(selection_heap_.size() * sizeof(VersionedHeapEntry));
+        result["heap_max_estimated_bytes"] = static_cast<int64_t>(heap_max_size_observed_ * sizeof(VersionedHeapEntry));
+        result["heap_auxiliary_state_bytes"] = static_cast<int64_t>(
+            heap_versions_.size() * sizeof(uint64_t) +
+            heap_dirty_mask_.size() * sizeof(uint8_t) +
+            guard_reason_.size() * sizeof(uint8_t) +
+            heap_dirty_edge_ids_.capacity() * sizeof(int64_t)
+        );
         return result;
     }
 
@@ -2277,7 +2682,7 @@ public:
     py::dict compute_selected_edge_delta_and_invalidate(
         const int64_t selected_edge_id,
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array
-    ) const {
+    ) {
         if (!has_edge_ids_) {
             throw std::runtime_error("NativeGraphState native invalidation requires edge id state.");
         }
@@ -2319,6 +2724,7 @@ public:
             if (edge_id >= static_cast<int64_t>(active_edge_mask_.size()) || active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
                 return;
             }
+            mark_heap_dirty(edge_id);
             if (valid_score_cache(edge_id) != 0) {
                 valid_score_cache(edge_id) = 0;
                 ++invalidated_count;
@@ -2367,7 +2773,7 @@ public:
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array,
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> delta_valid_cache_array,
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> candidate_delta_cache_array
-    ) const {
+    ) {
         if (!has_edge_ids_) {
             throw std::runtime_error("NativeGraphState candidate-delta update requires edge id state.");
         }
@@ -2478,6 +2884,7 @@ public:
             if (edge_id >= static_cast<int64_t>(active_edge_mask_.size()) || active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
                 return;
             }
+            mark_heap_dirty(edge_id);
             if (valid_score_cache(edge_id) != 0) {
                 valid_score_cache(edge_id) = 0;
                 ++invalidated_count;
@@ -2640,6 +3047,18 @@ public:
         if (active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
             throw std::runtime_error("NativeGraphState remove_edge called for a non-active undirected edge.");
         }
+        if (heap_initialized_) {
+            const uint8_t reason = guard_reason_[static_cast<size_t>(edge_id)];
+            if (reason == 0) {
+                --eligible_active_count_;
+            } else if (reason == 1) {
+                --d_min_blocked_count_;
+            } else if (reason == 2) {
+                --bridge_blocked_count_;
+            }
+            ++heap_versions_[static_cast<size_t>(edge_id)];
+            heap_dirty_mask_[static_cast<size_t>(edge_id)] = 0;
+        }
         active_edge_mask_[static_cast<size_t>(edge_id)] = 0;
         const auto& edge = edge_by_id_[static_cast<size_t>(edge_id)];
         if (current_degrees_[static_cast<size_t>(edge[0])] <= 0 || current_degrees_[static_cast<size_t>(edge[1])] <= 0) {
@@ -2648,6 +3067,15 @@ public:
         --current_degrees_[static_cast<size_t>(edge[0])];
         --current_degrees_[static_cast<size_t>(edge[1])];
         --active_edge_count_;
+        if (heap_initialized_) {
+            for (const int node : {edge[0], edge[1]}) {
+                if (current_degrees_[static_cast<size_t>(node)] <= heap_d_min_) {
+                    for (const int64_t incident_edge_id : incident_edge_ids_[static_cast<size_t>(node)]) {
+                        mark_heap_guard_reason(incident_edge_id, static_cast<uint8_t>(1));
+                    }
+                }
+            }
+        }
     }
 
     int64_t directed_edge_count() const {
@@ -2684,6 +3112,94 @@ public:
     }
 
 private:
+    void mark_heap_dirty(const int64_t edge_id) {
+        if (!heap_initialized_) {
+            return;
+        }
+        if (edge_id < 0 || edge_id >= original_edge_count_) {
+            return;
+        }
+        if (
+            active_edge_mask_[static_cast<size_t>(edge_id)] == 0 ||
+            guard_reason_[static_cast<size_t>(edge_id)] != 0
+        ) {
+            return;
+        }
+        if (heap_dirty_mask_[static_cast<size_t>(edge_id)] != 0) {
+            return;
+        }
+        heap_dirty_mask_[static_cast<size_t>(edge_id)] = 1;
+        heap_dirty_edge_ids_.push_back(edge_id);
+        ++heap_versions_[static_cast<size_t>(edge_id)];
+    }
+
+    void mark_heap_guard_reason(const int64_t edge_id, const uint8_t reason) {
+        if (edge_id < 0 || edge_id >= original_edge_count_ || reason == 0) {
+            return;
+        }
+        if (active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
+            return;
+        }
+        uint8_t& current_reason = guard_reason_[static_cast<size_t>(edge_id)];
+        if (reason == 1) {
+            if (current_reason != 0) {
+                return;
+            }
+            current_reason = 1;
+            ++d_min_blocked_count_;
+            --eligible_active_count_;
+        } else if (reason == 2) {
+            if (current_reason == 2) {
+                return;
+            }
+            if (current_reason == 1) {
+                --d_min_blocked_count_;
+            } else {
+                --eligible_active_count_;
+            }
+            current_reason = 2;
+            ++bridge_blocked_count_;
+        } else {
+            throw std::runtime_error("Unknown heap guard reason.");
+        }
+        ++heap_versions_[static_cast<size_t>(edge_id)];
+    }
+
+    template <typename ScoreView, typename DegreeView, typename SupportView, typename ValidView>
+    void rebuild_selection_heap(
+        const ScoreView& score_cache,
+        const DegreeView& degree_score_cache,
+        const SupportView& support_score_cache,
+        const ValidView& valid_score_cache
+    ) {
+        decltype(selection_heap_) rebuilt;
+        heap_rebuild_edge_entries_scanned_total_ += original_edge_count_;
+        for (int64_t edge_id = 0; edge_id < original_edge_count_; ++edge_id) {
+            if (
+                active_edge_mask_[static_cast<size_t>(edge_id)] == 0 ||
+                guard_reason_[static_cast<size_t>(edge_id)] != 0 ||
+                heap_dirty_mask_[static_cast<size_t>(edge_id)] != 0 ||
+                valid_score_cache(edge_id) == 0
+            ) {
+                continue;
+            }
+            const EdgeKey key{
+                score_cache(edge_id),
+                degree_score_cache(edge_id),
+                support_score_cache(edge_id),
+                edge_id,
+            };
+            rebuilt.push(VersionedHeapEntry{key, heap_versions_[static_cast<size_t>(edge_id)]});
+            ++heap_push_count_total_;
+        }
+        selection_heap_.swap(rebuilt);
+        ++heap_rebuild_count_total_;
+        heap_max_size_observed_ = std::max<int64_t>(
+            heap_max_size_observed_,
+            static_cast<int64_t>(selection_heap_.size())
+        );
+    }
+
     const int64_t* adjacency_edge_ids_ptr() const {
         return has_edge_ids_ ? adjacency_edge_ids_.data() : nullptr;
     }
@@ -2712,6 +3228,30 @@ private:
     std::unordered_map<uint64_t, int64_t> edge_code_to_id_;
     std::vector<std::vector<int64_t>> incident_edge_ids_;
     std::vector<uint8_t> active_edge_mask_;
+
+    std::priority_queue<VersionedHeapEntry, std::vector<VersionedHeapEntry>, VersionedHeapGreater> selection_heap_;
+    std::vector<uint64_t> heap_versions_;
+    std::vector<uint8_t> heap_dirty_mask_;
+    std::vector<int64_t> heap_dirty_edge_ids_;
+    // Guard reason priority matches the reference scan: bridge before d_min.
+    // 0 = eligible/unblocked, 1 = d_min blocked, 2 = bridge blocked.
+    std::vector<uint8_t> guard_reason_;
+    bool heap_initialized_ = false;
+    bool heap_guard_configuration_initialized_ = false;
+    int heap_d_min_ = -1;
+    bool heap_guard_bridges_ = false;
+    int64_t eligible_active_count_ = 0;
+    int64_t bridge_blocked_count_ = 0;
+    int64_t d_min_blocked_count_ = 0;
+    int64_t heap_push_count_total_ = 0;
+    int64_t heap_pop_count_total_ = 0;
+    int64_t heap_stale_pop_count_total_ = 0;
+    int64_t heap_inactive_pop_count_total_ = 0;
+    int64_t heap_guard_pop_count_total_ = 0;
+    int64_t heap_dirty_pop_count_total_ = 0;
+    int64_t heap_rebuild_count_total_ = 0;
+    int64_t heap_rebuild_edge_entries_scanned_total_ = 0;
+    int64_t heap_max_size_observed_ = 0;
 };
 
 py::dict canonical_tables() {
@@ -2781,6 +3321,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         >())
         .def("eligible_edge_id_partitions", &NativeGraphState::eligible_edge_id_partitions, py::arg("active_edge_ids"), py::arg("edge_array_by_id"), py::arg("degrees"), py::arg("d_min"), py::arg("guard_bridges"), py::arg("valid_score_cache"), py::arg("use_score_cache"))
         .def("eligible_edge_id_partitions_with_cached_best", &NativeGraphState::eligible_edge_id_partitions_with_cached_best, py::arg("active_edge_ids"), py::arg("degrees"), py::arg("d_min"), py::arg("guard_bridges"), py::arg("valid_score_cache"), py::arg("use_score_cache"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("delta_valid_cache") = py::none())
+        .def("prepare_versioned_heap_round", &NativeGraphState::prepare_versioned_heap_round, py::arg("d_min"), py::arg("guard_bridges"), py::arg("valid_score_cache"), py::arg("delta_valid_cache") = py::none())
+        .def("commit_dirty_heap_keys", &NativeGraphState::commit_dirty_heap_keys, py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("rebuild_ratio") = 4.0)
+        .def("pop_best_versioned_heap", &NativeGraphState::pop_best_versioned_heap)
+        .def("versioned_heap_statistics", &NativeGraphState::versioned_heap_statistics)
         .def("score_edges_round_best", &NativeGraphState::score_edges_round_best_state, py::arg("candidate_edges"), py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
         .def("score_edge_ids_round_best", &NativeGraphState::score_edge_ids_round_best, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
         .def("refresh_scores_from_delta_cache", &NativeGraphState::refresh_scores_from_delta_cache, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("candidate_delta_cache"), py::arg("delta_valid_cache"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"))
