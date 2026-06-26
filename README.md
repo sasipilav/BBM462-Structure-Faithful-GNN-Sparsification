@@ -211,3 +211,35 @@ RelShift pruning artifacts also include:
 - `0.015 < gap <= 0.02` is auxiliary only and must not be mixed into the main claim.
 - The local DSpar baseline keeps the paper/source sampling rule: `p_e proportional to 1/deg(u)+1/deg(v)` and `Q = 0.16 n log(n) / epsilon^2`.
 - The local LSP baseline is re-frozen to the upstream `dotd/GNN_experiments` pruning surface at commit `aa9cf7a38d23cee005a3e5b4df9a60fee1f46ea3`. `LSP-T` does not expose the paper-level `m` bin parameter as a runnable hyperparameter here; `lsp_m` stays empty and `sparsity` remains the active control.
+
+## Exact RelShift runtime profiling
+
+Phase 1 profiling is enabled with `configs/pruning/relshift_incremental_profile.yaml` or by setting the following pruning options:
+
+```yaml
+profile_rounds: true
+write_runtime_profile: true
+profile_memory: true
+profile_update_diagnostics: false
+profile_native_kernel: false
+```
+
+Run a controlled profile:
+
+```bash
+python scripts/profile_relshift_exact.py \
+  --dataset configs/datasets/cora.yaml \
+  --pruning configs/pruning/relshift_incremental_profile.yaml \
+  --rho 0.05 \
+  --warmup-runs 1 \
+  --repeats 3 \
+  --output-root results/relshift_exact_profile/cora
+```
+
+Each measured run writes:
+
+- `runtime_summary.json`: wall-clock decomposition, cache behavior, counts, memory lower bounds, environment information, and profiling coverage.
+- `runtime_by_round.csv`: round-level bridge, eligibility, rescoring, selection, state update, edge removal, active-list maintenance, local-structure, and memory metrics.
+- `pruning_result.json`, `pruned_edges.pt`, and `removed_edges.pt`: the corresponding exact pruning result.
+
+The aggregate files `profile_runs.csv` and `profile_runs.json` compare repeated measured runs. `profile_native_kernel: true` exposes native sub-kernel timings but disables the normal parallel scoring path, so it should be used as a separate diagnostic run rather than mixed with production runtime measurements.

@@ -13,3 +13,5 @@ venv/
 .venv/
 results.zip
 results-csv/
+report/
+tests/

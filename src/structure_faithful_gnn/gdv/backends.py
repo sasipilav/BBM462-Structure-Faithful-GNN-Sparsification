@@ -67,6 +67,7 @@ class OrcaBackend:
 class GDVService:
     def __init__(self, backend: str, cache_root: str | Path, *, orca_path: str | None = None) -> None:
         self.cache_root = ensure_dir(cache_root)
+        self.last_compute_info: dict[str, object] = {}
         backend_name = backend.lower()
         if backend_name == "orca":
             self.backend: GDVBackend = OrcaBackend(orca_path=orca_path)
@@ -88,9 +89,24 @@ class GDVService:
         cache_path = self.cache_root / cache_namespace / f"{self.backend.name}_{stable_hash_edges(num_nodes, edge_index)}.npy"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if cache_path.exists():
-            return np.load(cache_path)
+            result = np.load(cache_path)
+            self.last_compute_info = {
+                "cache_hit": True,
+                "cache_path": str(cache_path),
+                "backend": self.backend.name,
+                "num_nodes": int(num_nodes),
+                "num_edges": int(edge_index.shape[1]),
+            }
+            return result
         result = self.backend.compute(num_nodes, edge_index)
         np.save(cache_path, result)
+        self.last_compute_info = {
+            "cache_hit": False,
+            "cache_path": str(cache_path),
+            "backend": self.backend.name,
+            "num_nodes": int(num_nodes),
+            "num_edges": int(edge_index.shape[1]),
+        }
         return result
 
 

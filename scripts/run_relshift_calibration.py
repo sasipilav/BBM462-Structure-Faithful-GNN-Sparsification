@@ -269,6 +269,7 @@ def _relshift_artifact_is_current(artifact, *, base_pruning_config) -> bool:
     metadata = artifact.metadata or {}
     requested_engine = str((base_pruning_config.options or {}).get("relshift_engine", "auto")).strip().lower() or "auto"
     requested_write_edge_scores = bool((base_pruning_config.options or {}).get("write_edge_scores", False))
+    requested_runtime_profile = bool((base_pruning_config.options or {}).get("write_runtime_profile", False))
     requested_kernel_variant = str((base_pruning_config.options or {}).get("native_kernel_variant", "mask_count_v4_combinatorial")).strip().lower()
     expected_kernel_variant = requested_kernel_variant
     expected_kernel_versions = {
@@ -324,6 +325,8 @@ def _relshift_artifact_is_current(artifact, *, base_pruning_config) -> bool:
     if metadata.get("score_node_scope") != "edge_endpoints_only":
         return False
     if requested_write_edge_scores and not metadata.get("write_edge_scores", False):
+        return False
+    if requested_runtime_profile and not metadata.get("write_runtime_profile", False):
         return False
     structural_metrics = metadata.get("structural_metrics", {})
     required = {"mean_delta_sig", "median_delta_sig", "mean_delta_rel", "median_delta_rel"}

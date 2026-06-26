@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
+import platform
+import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +67,11 @@ def relshift_prune(
     verbose = bool((config.options or {}).get("verbose", False))
     profile_rounds = bool((config.options or {}).get("profile_rounds", False))
     profile_update_diagnostics = bool((config.options or {}).get("profile_update_diagnostics", False))
+    write_runtime_profile = bool((config.options or {}).get("write_runtime_profile", profile_rounds))
+    collect_runtime_profile = bool(profile_rounds or write_runtime_profile)
+    profile_memory = bool((config.options or {}).get("profile_memory", write_runtime_profile))
+    profile_label = str((config.options or {}).get("profile_label", "")).strip()
+    peak_rss_start_mb = _peak_rss_mb() if profile_memory else None
     use_native_graph_state = bool((config.options or {}).get("use_native_graph_state", True))
     profile_native_kernel = bool((config.options or {}).get("profile_native_kernel", False))
     native_omp_threads = int((config.options or {}).get("native_omp_threads", 0) or 0)
@@ -87,11 +97,14 @@ def relshift_prune(
             num_nodes=bundle.num_nodes,
         )
     )
+    configuration_setup_runtime_sec = float(time.perf_counter() - start)
+    extension_setup_start = time.perf_counter()
     if relshift_engine == "incremental_sequential_exact":
         _require_incremental_extension()
         if native_omp_threads > 0:
             _set_native_openmp_threads(native_omp_threads)
     native_openmp_info = _native_openmp_info() if is_incremental_sequential else {"openmp_enabled": False, "openmp_max_threads": 1}
+    extension_setup_runtime_sec = float(time.perf_counter() - extension_setup_start)
     _relshift_log(
         verbose,
         f"[relshift] start dataset={bundle.name} backend={gdv_service.backend_name} "
@@ -100,12 +113,14 @@ def relshift_prune(
     initial_gdv_start = time.perf_counter()
     original_raw = gdv_service.compute_graph_gdv(bundle.num_nodes, bundle.edge_index, cache_namespace="original_full")
     initial_gdv_runtime_sec = float(time.perf_counter() - initial_gdv_start)
+    initial_gdv_compute_info = dict(getattr(gdv_service, "last_compute_info", {}) or {})
     standardization_start = time.perf_counter()
     stats = fit_standardization(original_raw)
     current_raw = original_raw.copy()
     current_std = apply_standardization(current_raw, stats)
     standardization_runtime_sec = float(time.perf_counter() - standardization_start)
 
+    state_initialization_start = time.perf_counter()
     removed_total: list[tuple[int, int]] = []
     round_summaries: list[dict[str, object]] = []
     analysis_rows: list[dict[str, object]] = []
@@ -140,13 +155,22 @@ def relshift_prune(
         raise RuntimeError("mixed-correction candidate delta cache requires persistent native graph state.")
     invalidation_marks = np.zeros(len(edge_by_id), dtype=np.uint32)
     invalidation_epoch = 1
+    pruning_state_initialization_runtime_sec = float(time.perf_counter() - state_initialization_start)
 
     for round_idx, round_budget in enumerate(round_budgets, start=1):
         current_edge_count = len(active_edge_ids) if is_incremental_sequential else int(current_edges.shape[1])
         if round_budget <= 0 or current_edge_count == 0:
             continue
 
-        round_profile: dict[str, float] = {}
+        round_profile: dict[str, object] = {
+            "active_edge_count_before": int(current_edge_count),
+        }
+        if collect_runtime_profile:
+            round_profile["mean_degree_before"] = float(np.mean(current_degrees)) if current_degrees.size else 0.0
+            round_profile["max_degree_before"] = int(np.max(current_degrees)) if current_degrees.size else 0
+            round_profile["min_degree_before"] = int(np.min(current_degrees)) if current_degrees.size else 0
+            if profile_memory:
+                round_profile["peak_rss_mb_before"] = _peak_rss_mb()
         setup_start = time.perf_counter()
         round_start = setup_start
         if is_incremental_sequential:
@@ -211,6 +235,7 @@ def relshift_prune(
             guard_counts["eligible"] = int(guard_result["eligible_count"])
             guard_counts["bridge_guard"] = int(guard_result["blocked_by_bridge_count"])
             guard_counts["d_min_guard"] = int(guard_result["blocked_by_d_min_count"])
+            round_profile["bridge_count"] = int(guard_result.get("bridge_count", 0))
             round_profile["bridge_runtime_sec"] = float(guard_result["bridge_runtime_sec"])
             round_profile["tarjan_bridge_runtime_sec"] = round_profile["bridge_runtime_sec"] if config.guard_bridges else 0.0
             round_profile["eligibility_runtime_sec"] = float(guard_result["eligibility_runtime_sec"])
@@ -226,6 +251,7 @@ def relshift_prune(
                 else set()
             )
             round_profile["bridge_runtime_sec"] = float(time.perf_counter() - timer)
+            round_profile["bridge_count"] = int(len(bridges))
             round_profile["tarjan_bridge_runtime_sec"] = round_profile["bridge_runtime_sec"] if config.guard_bridges and is_incremental_sequential else 0.0
             timer = time.perf_counter()
             if is_incremental_sequential:
@@ -250,11 +276,25 @@ def relshift_prune(
         eligible_count = guard_counts["eligible"]
         if eligible_count == 0:
             _relshift_log(verbose, f"[relshift] round={round_idx} no eligible edges")
+            no_eligible_runtime_sec = float(time.perf_counter() - round_start)
+            round_profile["active_edge_count_after"] = int(current_edge_count)
+            round_profile["accounted_runtime_sec"] = float(round_profile["round_setup_runtime_sec"])
+            round_profile["unaccounted_runtime_sec"] = max(
+                0.0, no_eligible_runtime_sec - float(round_profile["round_setup_runtime_sec"])
+            )
+            round_profile["runtime_coverage_ratio"] = (
+                min(1.0, float(round_profile["round_setup_runtime_sec"]) / no_eligible_runtime_sec)
+                if no_eligible_runtime_sec > 0.0
+                else 1.0
+            )
+            if profile_memory:
+                round_profile["peak_rss_mb_after"] = _peak_rss_mb()
             round_summaries.append(
                 {
                     "round": round_idx,
                     "requested_round_budget": round_budget,
                     "achieved_round_budget": 0,
+                    "active_edge_count_before": current_edge_count,
                     "eligible_count": 0,
                     "blocked_by_bridge_count": guard_counts["bridge_guard"],
                     "blocked_by_d_min_count": guard_counts["d_min_guard"],
@@ -266,10 +306,10 @@ def relshift_prune(
                     "local_update_runtime_sec": 0.0,
                     "selected_delta_runtime_sec": 0.0,
                     "apply_state_update_runtime_sec": 0.0,
-                    "round_runtime_sec": float(round_profile["round_setup_runtime_sec"]),
-                    "round_runtime_excluding_analysis_sec": float(round_profile["round_setup_runtime_sec"]),
+                    "round_runtime_sec": no_eligible_runtime_sec,
+                    "round_runtime_excluding_analysis_sec": no_eligible_runtime_sec,
                     "round_runtime_excluding_setup_sec": 0.0,
-                    **(round_profile if profile_rounds else {}),
+                    **(round_profile if collect_runtime_profile else {}),
                 }
             )
             continue
@@ -309,6 +349,7 @@ def relshift_prune(
 
         selected_edge_id: int | None = None
         selected: list[EdgeScore] = []
+        round_profile["best_selection_runtime_sec"] = 0.0
         if fast_incremental_selection:
             refreshed_best_edge_id = None
             if refresh_edge_ids:
@@ -367,6 +408,7 @@ def relshift_prune(
                 )
             else:
                 _relshift_log(verbose, f"[relshift] round={round_idx} rescored=0 reused={reused_score_count} native_score_sec=0.0000")
+            best_selection_start = time.perf_counter()
             if native_cached_best_edge_id >= 0:
                 cached_best_edge_id = native_cached_best_edge_id
             else:
@@ -393,6 +435,7 @@ def relshift_prune(
                 raise RuntimeError("Incremental RelShift could not select an edge from non-empty eligible set.")
             selected_edge = edge_by_id[selected_edge_id]
             removed_round = [selected_edge]
+            round_profile["best_selection_runtime_sec"] = float(time.perf_counter() - best_selection_start)
         elif relshift_engine == "incremental_sequential_exact":
             if rescored_edges:
                 rescored_scores, native_score_runtime_sec, incremental_score_profile = _compute_edge_scores_incremental_round(
@@ -453,6 +496,8 @@ def relshift_prune(
             removed_round = [score.edge for score in selected]
         round_profile["score_sort_runtime_sec"] = float(time.perf_counter() - timer)
         round_profile["score_selection_runtime_sec"] = round_profile["score_sort_runtime_sec"]
+        if not fast_incremental_selection:
+            round_profile["best_selection_runtime_sec"] = round_profile["score_selection_runtime_sec"]
         removed_total.extend(removed_round)
         update_block_start = time.perf_counter()
         selected_delta_runtime_sec = 0.0
@@ -557,21 +602,38 @@ def relshift_prune(
         else:
             invalidated_score_edges = set()
         round_profile["cache_invalidation_runtime_sec"] = float(time.perf_counter() - timer)
-        timer = time.perf_counter()
+        remove_edge_block_start = time.perf_counter()
+        round_profile["python_incremental_state_removal_runtime_sec"] = 0.0
+        round_profile["native_graph_edge_removal_runtime_sec"] = 0.0
+        round_profile["active_edge_list_rebuild_runtime_sec"] = 0.0
+        round_profile["batch_edge_tensor_removal_runtime_sec"] = 0.0
         if is_incremental_sequential:
+            timer = time.perf_counter()
             _remove_edges_from_incremental_state(
                 current_adjacency=current_adjacency,
                 current_degrees=current_degrees,
                 removed_round=removed_round,
             )
+            round_profile["python_incremental_state_removal_runtime_sec"] = float(time.perf_counter() - timer)
             if native_graph_state is not None:
+                timer = time.perf_counter()
                 native_graph_state.remove_edge(int(removed_round[0][0]), int(removed_round[0][1]))
+                round_profile["native_graph_edge_removal_runtime_sec"] = float(time.perf_counter() - timer)
+            timer = time.perf_counter()
             removed_edge_ids = [edge_to_id[edge] for edge in removed_round]
             removed_edge_id_set = set(removed_edge_ids)
             active_edge_ids = [edge_id for edge_id in active_edge_ids if edge_id not in removed_edge_id_set]
+            round_profile["active_edge_list_rebuild_runtime_sec"] = float(time.perf_counter() - timer)
         else:
+            timer = time.perf_counter()
             current_edges = remove_edge_pairs(current_edges, removed_round)
-        round_profile["remove_edge_runtime_sec"] = float(time.perf_counter() - timer)
+            round_profile["batch_edge_tensor_removal_runtime_sec"] = float(time.perf_counter() - timer)
+        round_profile["remove_edge_runtime_sec"] = float(time.perf_counter() - remove_edge_block_start)
+        round_profile["active_edge_count_after"] = int(len(active_edge_ids) if is_incremental_sequential else current_edges.shape[1])
+        round_profile["valid_score_cache_count_after"] = int(valid_score_cache.sum()) if is_incremental_sequential else int(len(score_cache))
+        round_profile["delta_valid_cache_count_after"] = int(delta_valid_cache.sum()) if is_incremental_sequential else 0
+        if profile_memory:
+            round_profile["peak_rss_mb_after"] = _peak_rss_mb()
 
         if fast_incremental_selection:
             avg_directly_attached_size = float(round_profile.get("avg_directly_attached_size", 0.0))
@@ -610,6 +672,26 @@ def relshift_prune(
         round_profile["round_runtime_excluding_analysis_sec"] = round_runtime_excluding_analysis_sec
         round_profile["round_runtime_excluding_setup_sec"] = round_runtime_excluding_setup_sec
         round_profile["round_runtime_sec"] = round_runtime_sec
+        cache_partition_outside_setup_sec = (
+            0.0 if fast_incremental_selection else float(round_profile.get("cache_partition_runtime_sec", 0.0))
+        )
+        accounted_runtime_sec = (
+            float(round_profile.get("round_setup_runtime_sec", 0.0))
+            + cache_partition_outside_setup_sec
+            + native_score_runtime_sec
+            + native_scalar_refresh_runtime_sec
+            + float(round_profile.get("best_selection_runtime_sec", 0.0))
+            + local_update_runtime_sec
+            + float(round_profile.get("dirty_signature_nodes_runtime_sec", 0.0))
+            + float(round_profile.get("cache_invalidation_runtime_sec", 0.0))
+            + float(round_profile.get("remove_edge_runtime_sec", 0.0))
+            + float(round_profile.get("analysis_row_build_runtime_sec", 0.0))
+        )
+        round_profile["accounted_runtime_sec"] = accounted_runtime_sec
+        round_profile["unaccounted_runtime_sec"] = max(0.0, round_runtime_sec - accounted_runtime_sec)
+        round_profile["runtime_coverage_ratio"] = (
+            min(1.0, accounted_runtime_sec / round_runtime_sec) if round_runtime_sec > 0.0 else 1.0
+        )
         python_round_overhead_sec = (
             max(0.0, round_runtime_sec - native_score_runtime_sec - local_update_runtime_sec)
             if relshift_engine == "incremental_sequential_exact"
@@ -621,6 +703,7 @@ def relshift_prune(
                 "round": round_idx,
                 "requested_round_budget": round_budget,
                 "achieved_round_budget": len(removed_round),
+                "active_edge_count_before": current_edge_count,
                 "eligible_count": guard_counts["eligible"],
                 "blocked_by_bridge_count": guard_counts["bridge_guard"],
                 "blocked_by_d_min_count": guard_counts["d_min_guard"],
@@ -628,8 +711,10 @@ def relshift_prune(
                 "selected_count": len(removed_round),
                 "rescored_edge_count": len(rescored_edge_ids) if fast_incremental_selection else len(rescored_edges),
                 "scalar_refreshed_edge_count": scalar_refreshed_score_count,
+                "refresh_candidate_count": len(refresh_edge_ids),
                 "reused_score_count": reused_score_count,
                 "invalidated_score_count": invalidated_score_count,
+                "bridge_count": int(round_profile.get("bridge_count", 0)),
                 "native_score_runtime_sec": native_score_runtime_sec,
                 "native_scalar_refresh_runtime_sec": native_scalar_refresh_runtime_sec,
                 "python_round_overhead_sec": python_round_overhead_sec,
@@ -639,7 +724,7 @@ def relshift_prune(
                 "remaining_edges": len(active_edge_ids) if is_incremental_sequential else int(current_edges.shape[1]),
                 "removed_edges": [[edge[0], edge[1]] for edge in removed_round],
                 **local_update_summary,
-                **(round_profile if profile_rounds else {}),
+                **(round_profile if collect_runtime_profile else {}),
             }
         )
         _relshift_log(
@@ -659,6 +744,54 @@ def relshift_prune(
     total_runtime_including_score_write_sec = float(time.perf_counter() - start)
     final_active_edges = [edge_by_id[edge_id] for edge_id in active_edge_ids] if is_incremental_sequential else active_edges
     pruned_edge_index = _edges_tensor(final_active_edges) if is_incremental_sequential else current_edges
+
+    peak_rss_end_mb = _peak_rss_mb() if profile_memory else None
+    known_state_bytes = _known_profile_state_bytes(
+        edge_array_by_id=edge_array_by_id,
+        current_raw=current_raw,
+        current_std=current_std,
+        score_cache_values=score_cache_values,
+        degree_score_cache_values=degree_score_cache_values,
+        support_score_cache_values=support_score_cache_values,
+        valid_score_cache=valid_score_cache,
+        candidate_delta_cache=candidate_delta_cache,
+        delta_valid_cache=delta_valid_cache,
+        invalidation_marks=invalidation_marks,
+    )
+    runtime_summary = _build_runtime_summary(
+        bundle=bundle,
+        config=config,
+        seed=seed,
+        profile_label=profile_label,
+        relshift_engine=relshift_engine,
+        budget=budget,
+        removed_total=removed_total,
+        runtime_sec=float(runtime),
+        total_runtime_including_score_write_sec=total_runtime_including_score_write_sec,
+        configuration_setup_runtime_sec=configuration_setup_runtime_sec,
+        extension_setup_runtime_sec=extension_setup_runtime_sec,
+        initial_gdv_runtime_sec=initial_gdv_runtime_sec,
+        initial_gdv_compute_info=initial_gdv_compute_info,
+        standardization_runtime_sec=standardization_runtime_sec,
+        initial_native_graph_state_runtime_sec=initial_native_graph_state_runtime_sec,
+        pruning_state_initialization_runtime_sec=pruning_state_initialization_runtime_sec,
+        score_table_write_runtime_sec=score_table_write_runtime_sec,
+        round_summaries=round_summaries,
+        peak_rss_start_mb=peak_rss_start_mb,
+        peak_rss_end_mb=peak_rss_end_mb,
+        known_state_bytes=known_state_bytes,
+        native_openmp_info=native_openmp_info,
+        profile_native_kernel=profile_native_kernel,
+    )
+    runtime_summary_path: Path | None = None
+    runtime_by_round_path: Path | None = None
+    runtime_profile_write_runtime_sec = 0.0
+    if artifact_dir is not None and write_runtime_profile:
+        runtime_summary_path, runtime_by_round_path, runtime_profile_write_runtime_sec = _write_runtime_profile_artifacts(
+            artifact_dir,
+            summary=runtime_summary,
+            round_summaries=round_summaries,
+        )
 
     return PruningResult(
         method="relshift",
@@ -688,6 +821,13 @@ def relshift_prune(
             "verbose": verbose,
             "profile_rounds": profile_rounds,
             "profile_update_diagnostics": profile_update_diagnostics,
+            "write_runtime_profile": write_runtime_profile,
+            "profile_memory": profile_memory,
+            "profile_label": profile_label,
+            "runtime_summary_path": str(runtime_summary_path) if runtime_summary_path else None,
+            "runtime_by_round_path": str(runtime_by_round_path) if runtime_by_round_path else None,
+            "runtime_profile_write_runtime_sec": runtime_profile_write_runtime_sec,
+            "runtime_profile": runtime_summary if write_runtime_profile else None,
             "use_native_graph_state": use_native_graph_state,
             "profile_native_kernel": profile_native_kernel,
             "native_omp_threads_requested": native_omp_threads,
@@ -709,9 +849,17 @@ def relshift_prune(
             "native_guard_mode": "native_tarjan_eligibility" if is_incremental_sequential and not write_edge_scores else "python_guard_loop",
             "native_graph_state_mode": "persistent_dynamic_csr" if native_graph_state is not None else "per_round_python_csr",
             "csr_reuse_mode": "persistent_native_graph_state" if native_graph_state is not None else "shared_round_csr" if is_incremental_sequential and not write_edge_scores else "per_operation_csr",
+            "configuration_setup_runtime_sec": configuration_setup_runtime_sec,
+            "extension_setup_runtime_sec": extension_setup_runtime_sec,
             "initial_gdv_runtime_sec": initial_gdv_runtime_sec,
+            "initial_gdv_cache_hit": initial_gdv_compute_info.get("cache_hit"),
+            "initial_gdv_cache_path": initial_gdv_compute_info.get("cache_path"),
             "standardization_runtime_sec": standardization_runtime_sec,
             "initial_native_graph_state_runtime_sec": initial_native_graph_state_runtime_sec,
+            "pruning_state_initialization_runtime_sec": pruning_state_initialization_runtime_sec,
+            "peak_rss_start_mb": peak_rss_start_mb,
+            "peak_rss_end_mb": peak_rss_end_mb,
+            "known_numpy_state_total_bytes": known_state_bytes["known_numpy_state_total_bytes"],
             "openmp_enabled": bool(native_openmp_info.get("openmp_enabled", False)),
             "openmp_max_threads": int(native_openmp_info.get("openmp_max_threads", 1)),
             "native_edge_id_scoring": bool(native_graph_state is not None),
@@ -1336,6 +1484,7 @@ def _eligible_edge_id_partitions_incremental_native(
         "refresh_count": int(result.get("refresh_count", len(refresh_edge_ids))),
         "blocked_by_bridge_count": int(result["blocked_by_bridge_count"]),
         "blocked_by_d_min_count": int(result["blocked_by_d_min_count"]),
+        "bridge_count": int(result.get("bridge_count", 0)),
         "bridge_runtime_sec": float(result["bridge_runtime_sec"]),
         "eligibility_runtime_sec": float(result["eligibility_runtime_sec"]),
         "cache_partition_runtime_sec": float(result.get("cache_partition_runtime_sec", 0.0)),
@@ -1369,6 +1518,7 @@ def _eligible_edge_ids_incremental_native(
         "eligible_count": int(result["eligible_count"]),
         "blocked_by_bridge_count": int(result["blocked_by_bridge_count"]),
         "blocked_by_d_min_count": int(result["blocked_by_d_min_count"]),
+        "bridge_count": int(result.get("bridge_count", 0)),
         "bridge_runtime_sec": float(result["bridge_runtime_sec"]),
         "eligibility_runtime_sec": float(result["eligibility_runtime_sec"]),
     }
@@ -1672,3 +1822,346 @@ def _remove_edges_from_incremental_state(
         if u in current_adjacency[v]:
             current_adjacency[v].remove(u)
             current_degrees[v] -= 1
+
+
+def _peak_rss_mb() -> float | None:
+    """Return process peak resident memory in MiB when the platform exposes it."""
+    try:
+        import resource
+
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError):
+        return None
+    # Linux reports KiB; macOS/BSD report bytes.
+    if sys.platform == "darwin":
+        return peak / (1024.0 * 1024.0)
+    return peak / 1024.0
+
+
+def _cpu_model_name() -> str:
+    cpu_model = platform.processor().strip()
+    cpuinfo_path = Path("/proc/cpuinfo")
+    if cpuinfo_path.exists():
+        try:
+            for line in cpuinfo_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.lower().startswith("model name") and ":" in line:
+                    return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    return cpu_model or "unknown"
+
+
+def _sum_round_metric(round_summaries: list[dict[str, object]], key: str) -> float:
+    total = 0.0
+    for row in round_summaries:
+        value = row.get(key, 0.0)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            total += float(value)
+    return total
+
+
+def _mean_round_metric(round_summaries: list[dict[str, object]], key: str) -> float:
+    values = [
+        float(row[key])
+        for row in round_summaries
+        if isinstance(row.get(key), (int, float, np.integer, np.floating))
+    ]
+    return float(np.mean(values)) if values else 0.0
+
+
+def _known_profile_state_bytes(
+    *,
+    edge_array_by_id: np.ndarray,
+    current_raw: np.ndarray,
+    current_std: np.ndarray,
+    score_cache_values: np.ndarray,
+    degree_score_cache_values: np.ndarray,
+    support_score_cache_values: np.ndarray,
+    valid_score_cache: np.ndarray,
+    candidate_delta_cache: np.ndarray,
+    delta_valid_cache: np.ndarray,
+    invalidation_marks: np.ndarray,
+) -> dict[str, int]:
+    components = {
+        "edge_array_by_id_bytes": int(edge_array_by_id.nbytes),
+        "current_raw_bytes": int(current_raw.nbytes),
+        "current_std_bytes": int(current_std.nbytes),
+        "score_cache_bytes": int(score_cache_values.nbytes),
+        "degree_score_cache_bytes": int(degree_score_cache_values.nbytes),
+        "support_score_cache_bytes": int(support_score_cache_values.nbytes),
+        "valid_score_mask_bytes": int(valid_score_cache.nbytes),
+        "candidate_delta_cache_bytes": int(candidate_delta_cache.nbytes),
+        "delta_valid_mask_bytes": int(delta_valid_cache.nbytes),
+        "invalidation_marks_bytes": int(invalidation_marks.nbytes),
+    }
+    components["known_numpy_state_total_bytes"] = int(sum(components.values()))
+    return components
+
+
+def _build_runtime_summary(
+    *,
+    bundle: DatasetBundle,
+    config: PruningConfig,
+    seed: int,
+    profile_label: str,
+    relshift_engine: str,
+    budget: int,
+    removed_total: list[tuple[int, int]],
+    runtime_sec: float,
+    total_runtime_including_score_write_sec: float,
+    configuration_setup_runtime_sec: float,
+    extension_setup_runtime_sec: float,
+    initial_gdv_runtime_sec: float,
+    initial_gdv_compute_info: dict[str, object],
+    standardization_runtime_sec: float,
+    initial_native_graph_state_runtime_sec: float,
+    pruning_state_initialization_runtime_sec: float,
+    score_table_write_runtime_sec: float,
+    round_summaries: list[dict[str, object]],
+    peak_rss_start_mb: float | None,
+    peak_rss_end_mb: float | None,
+    known_state_bytes: dict[str, int],
+    native_openmp_info: dict[str, object],
+    profile_native_kernel: bool,
+) -> dict[str, object]:
+    round_wall_sec = _sum_round_metric(round_summaries, "round_runtime_sec")
+    round_accounted_sec = _sum_round_metric(round_summaries, "accounted_runtime_sec")
+    round_unaccounted_sec = max(0.0, round_wall_sec - round_accounted_sec)
+    top_level_accounted_sec = (
+        float(configuration_setup_runtime_sec)
+        + float(extension_setup_runtime_sec)
+        + float(initial_gdv_runtime_sec)
+        + float(standardization_runtime_sec)
+        + float(pruning_state_initialization_runtime_sec)
+        + round_wall_sec
+    )
+    top_level_unaccounted_sec = max(0.0, float(runtime_sec) - top_level_accounted_sec)
+
+    timing_keys = [
+        "round_setup_runtime_sec",
+        "bridge_runtime_sec",
+        "tarjan_bridge_runtime_sec",
+        "eligibility_runtime_sec",
+        "cache_partition_runtime_sec",
+        "native_score_runtime_sec",
+        "native_pair_generation_runtime_sec",
+        "native_delta_accumulation_runtime_sec",
+        "native_score_scalarization_runtime_sec",
+        "native_scalar_refresh_runtime_sec",
+        "best_selection_runtime_sec",
+        "selected_update_runtime_sec",
+        "selected_delta_runtime_sec",
+        "apply_state_update_runtime_sec",
+        "native_mixed_correction_runtime_sec",
+        "dirty_signature_nodes_runtime_sec",
+        "cache_invalidation_runtime_sec",
+        "remove_edge_runtime_sec",
+        "python_incremental_state_removal_runtime_sec",
+        "native_graph_edge_removal_runtime_sec",
+        "active_edge_list_rebuild_runtime_sec",
+        "batch_edge_tensor_removal_runtime_sec",
+        "analysis_row_build_runtime_sec",
+    ]
+    diagnostic_timings = {key: _sum_round_metric(round_summaries, key) for key in timing_keys}
+
+    count_keys = [
+        "eligible_count",
+        "blocked_by_bridge_count",
+        "blocked_by_d_min_count",
+        "rescored_edge_count",
+        "scalar_refreshed_edge_count",
+        "refresh_candidate_count",
+        "reused_score_count",
+        "invalidated_score_count",
+        "mixed_correction_edge_count",
+        "delta_impacted_full_rescore_count",
+        "update_union_size",
+    ]
+    totals = {key: int(round(_sum_round_metric(round_summaries, key))) for key in count_keys}
+    round_count = len(round_summaries)
+    achieved_budget = len(removed_total)
+    total_candidate_actions = (
+        totals["rescored_edge_count"]
+        + totals["scalar_refreshed_edge_count"]
+        + totals["reused_score_count"]
+    )
+
+    peak_values = [
+        float(value)
+        for row in round_summaries
+        for value in (row.get("peak_rss_mb_before"), row.get("peak_rss_mb_after"))
+        if isinstance(value, (int, float, np.integer, np.floating))
+    ]
+    if peak_rss_start_mb is not None:
+        peak_values.append(float(peak_rss_start_mb))
+    if peak_rss_end_mb is not None:
+        peak_values.append(float(peak_rss_end_mb))
+
+    return {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_label": profile_label,
+        "dataset": {
+            "name": bundle.name,
+            "num_nodes": bundle.num_nodes,
+            "num_edges": bundle.num_edges,
+        },
+        "run": {
+            "seed": int(seed),
+            "target_rho": float(config.rho),
+            "requested_budget": int(budget),
+            "achieved_budget": int(achieved_budget),
+            "achieved_edge_reduction": 1.0 - ((bundle.num_edges - achieved_budget) / max(bundle.num_edges, 1)),
+            "round_count": int(round_count),
+            "relshift_engine": relshift_engine,
+            "score_mode": config.score_mode,
+            "guard_bridges": bool(config.guard_bridges),
+            "d_min": int(config.d_min),
+            "profile_native_kernel": bool(profile_native_kernel),
+        },
+        "gdv": {
+            "backend": str(initial_gdv_compute_info.get("backend", getattr(config, "backend", ""))),
+            "cache_hit": initial_gdv_compute_info.get("cache_hit"),
+            "cache_path": initial_gdv_compute_info.get("cache_path"),
+        },
+        "wall_clock": {
+            "algorithm_runtime_sec": float(runtime_sec),
+            "runtime_including_score_write_sec": float(total_runtime_including_score_write_sec),
+            "score_table_write_runtime_sec": float(score_table_write_runtime_sec),
+            "configuration_setup_runtime_sec": float(configuration_setup_runtime_sec),
+            "extension_setup_runtime_sec": float(extension_setup_runtime_sec),
+            "initial_gdv_runtime_sec": float(initial_gdv_runtime_sec),
+            "standardization_runtime_sec": float(standardization_runtime_sec),
+            "initial_native_graph_state_runtime_sec": float(initial_native_graph_state_runtime_sec),
+            "pruning_state_initialization_runtime_sec": float(pruning_state_initialization_runtime_sec),
+            "round_wall_runtime_sec": round_wall_sec,
+            "round_accounted_runtime_sec": round_accounted_sec,
+            "round_unaccounted_runtime_sec": round_unaccounted_sec,
+            "round_runtime_coverage_ratio": min(1.0, round_accounted_sec / round_wall_sec) if round_wall_sec > 0 else 1.0,
+            "top_level_accounted_runtime_sec": top_level_accounted_sec,
+            "top_level_unaccounted_runtime_sec": top_level_unaccounted_sec,
+            "top_level_runtime_coverage_ratio": min(1.0, top_level_accounted_sec / runtime_sec) if runtime_sec > 0 else 1.0,
+        },
+        "diagnostic_timing_totals_sec": diagnostic_timings,
+        "count_totals": totals,
+        "count_means_per_round": {
+            key: _mean_round_metric(round_summaries, key)
+            for key in count_keys
+        },
+        "cache_behavior": {
+            "candidate_action_count": int(total_candidate_actions),
+            "reuse_ratio": (totals["reused_score_count"] / total_candidate_actions) if total_candidate_actions else 0.0,
+            "full_rescore_ratio": (totals["rescored_edge_count"] / total_candidate_actions) if total_candidate_actions else 0.0,
+            "scalar_refresh_ratio": (totals["scalar_refreshed_edge_count"] / total_candidate_actions) if total_candidate_actions else 0.0,
+        },
+        "local_structure": {
+            "mean_avg_directly_attached_size": _mean_round_metric(round_summaries, "avg_directly_attached_size"),
+            "mean_avg_four_node_pair_count": _mean_round_metric(round_summaries, "avg_four_node_pair_count"),
+            "mean_update_union_size": _mean_round_metric(round_summaries, "update_union_size"),
+            "max_update_union_size": int(max((int(row.get("update_union_size", 0)) for row in round_summaries), default=0)),
+            "mean_bridge_count": _mean_round_metric(round_summaries, "bridge_count"),
+        },
+        "memory": {
+            "peak_rss_start_mb": peak_rss_start_mb,
+            "peak_rss_end_mb": peak_rss_end_mb,
+            "peak_rss_observed_mb": max(peak_values) if peak_values else None,
+            **known_state_bytes,
+            "known_numpy_state_total_mib": known_state_bytes.get("known_numpy_state_total_bytes", 0) / (1024.0 * 1024.0),
+            "note": "Known-state bytes exclude Python container overhead, native CSR capacity, and allocator fragmentation.",
+        },
+        "environment": {
+            "python_version": sys.version.split()[0],
+            "numpy_version": np.__version__,
+            "torch_version": torch.__version__,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu_model": _cpu_model_name(),
+            "logical_cpu_count": os.cpu_count(),
+            "openmp_enabled": bool(native_openmp_info.get("openmp_enabled", False)),
+            "openmp_max_threads": int(native_openmp_info.get("openmp_max_threads", 1)),
+        },
+    }
+
+
+def _profile_csv_value(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    return value
+
+
+def _write_runtime_profile_artifacts(
+    artifact_dir: str | Path,
+    *,
+    summary: dict[str, object],
+    round_summaries: list[dict[str, object]],
+) -> tuple[Path, Path, float]:
+    output_dir = Path(artifact_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "runtime_summary.json"
+    rounds_path = output_dir / "runtime_by_round.csv"
+    write_start = time.perf_counter()
+
+    preferred_fields = [
+        "round",
+        "active_edge_count_before",
+        "active_edge_count_after",
+        "eligible_count",
+        "blocked_by_bridge_count",
+        "blocked_by_d_min_count",
+        "bridge_count",
+        "rescored_edge_count",
+        "scalar_refreshed_edge_count",
+        "refresh_candidate_count",
+        "reused_score_count",
+        "invalidated_score_count",
+        "mixed_correction_edge_count",
+        "delta_impacted_full_rescore_count",
+        "update_union_size",
+        "avg_directly_attached_size",
+        "avg_four_node_pair_count",
+        "round_runtime_sec",
+        "round_setup_runtime_sec",
+        "bridge_runtime_sec",
+        "eligibility_runtime_sec",
+        "native_score_runtime_sec",
+        "native_scalar_refresh_runtime_sec",
+        "best_selection_runtime_sec",
+        "selected_update_runtime_sec",
+        "selected_delta_runtime_sec",
+        "apply_state_update_runtime_sec",
+        "cache_invalidation_runtime_sec",
+        "remove_edge_runtime_sec",
+        "python_incremental_state_removal_runtime_sec",
+        "native_graph_edge_removal_runtime_sec",
+        "active_edge_list_rebuild_runtime_sec",
+        "analysis_row_build_runtime_sec",
+        "accounted_runtime_sec",
+        "unaccounted_runtime_sec",
+        "runtime_coverage_ratio",
+        "peak_rss_mb_before",
+        "peak_rss_mb_after",
+        "removed_edges",
+    ]
+    all_fields = {key for row in round_summaries for key in row.keys()}
+    fieldnames = [field for field in preferred_fields if field in all_fields]
+    fieldnames.extend(sorted(all_fields - set(fieldnames)))
+    with rounds_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in round_summaries:
+            writer.writerow({key: _profile_csv_value(row.get(key)) for key in fieldnames})
+
+    summary["artifacts"] = {
+        "runtime_summary_json": str(summary_path),
+        "runtime_by_round_csv": str(rounds_path),
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+    elapsed = float(time.perf_counter() - write_start)
+    return summary_path, rounds_path, elapsed
