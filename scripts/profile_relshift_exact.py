@@ -172,6 +172,7 @@ def _summary_row(run_index: int, summary: dict[str, object]) -> dict[str, object
     timings = dict(summary.get("diagnostic_timing_totals_sec", {}))
     memory = dict(summary.get("memory", {}))
     cache = dict(summary.get("cache_behavior", {}))
+    scaling = dict(summary.get("scaling_work", {}))
     return {
         "run": run_index,
         "dataset": dict(summary.get("dataset", {})).get("name"),
@@ -191,10 +192,23 @@ def _summary_row(run_index: int, summary: dict[str, object]) -> dict[str, object
         "selected_update_runtime_sec": timings.get("selected_update_runtime_sec"),
         "native_graph_edge_removal_runtime_sec": timings.get("native_graph_edge_removal_runtime_sec"),
         "active_edge_list_rebuild_runtime_sec": timings.get("active_edge_list_rebuild_runtime_sec"),
+        "total_active_edge_id_entries_scanned": scaling.get("total_active_edge_id_entries_scanned"),
+        "total_inactive_edge_ids_skipped": scaling.get("total_inactive_edge_ids_skipped"),
+        "total_bridge_adjacency_entries_visited": scaling.get("total_bridge_adjacency_entries_visited"),
+        "total_bridge_inactive_adjacency_entries_skipped": scaling.get(
+            "total_bridge_inactive_adjacency_entries_skipped"
+        ),
+        "max_tombstone_ratio_after": scaling.get("max_tombstone_ratio_after"),
         "reuse_ratio": cache.get("reuse_ratio"),
         "full_rescore_ratio": cache.get("full_rescore_ratio"),
         "peak_rss_observed_mb": memory.get("peak_rss_observed_mb"),
         "known_numpy_state_total_mib": memory.get("known_numpy_state_total_mib"),
+        "candidate_delta_cache_gib_at_1m_edges": memory.get("candidate_delta_cache_gib_at_1m_edges"),
+        "candidate_delta_cache_gib_at_10m_edges": memory.get("candidate_delta_cache_gib_at_10m_edges"),
+        "candidate_delta_cache_gib_at_60m_edges": memory.get("candidate_delta_cache_gib_at_60m_edges"),
+        "known_edge_state_gib_at_1m_edges": memory.get("known_edge_state_gib_at_1m_edges"),
+        "known_edge_state_gib_at_10m_edges": memory.get("known_edge_state_gib_at_10m_edges"),
+        "known_edge_state_gib_at_60m_edges": memory.get("known_edge_state_gib_at_60m_edges"),
     }
 
 

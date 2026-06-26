@@ -130,7 +130,9 @@ def relshift_prune(
     edge_by_id = list(active_edges)
     edge_array_by_id = np.asarray(edge_by_id, dtype=np.int64).reshape((-1, 2)) if edge_by_id else np.empty((0, 2), dtype=np.int64)
     edge_to_id = {edge: edge_id for edge_id, edge in enumerate(edge_by_id)}
-    active_edge_ids = list(range(len(edge_by_id)))
+    all_edge_ids = np.arange(len(edge_by_id), dtype=np.int64)
+    active_edge_mask = np.ones(len(edge_by_id), dtype=np.uint8)
+    active_edge_count = len(edge_by_id)
     incident_edge_ids: list[list[int]] = [[] for _ in range(bundle.num_nodes)]
     for edge_id, (u, v) in enumerate(edge_by_id):
         incident_edge_ids[u].append(edge_id)
@@ -158,7 +160,7 @@ def relshift_prune(
     pruning_state_initialization_runtime_sec = float(time.perf_counter() - state_initialization_start)
 
     for round_idx, round_budget in enumerate(round_budgets, start=1):
-        current_edge_count = len(active_edge_ids) if is_incremental_sequential else int(current_edges.shape[1])
+        current_edge_count = active_edge_count if is_incremental_sequential else int(current_edges.shape[1])
         if round_budget <= 0 or current_edge_count == 0:
             continue
 
@@ -178,8 +180,13 @@ def relshift_prune(
             round_profile["degree_runtime_sec"] = 0.0
             round_profile["support_runtime_sec"] = 0.0
             degrees = current_degrees
-            round_edges = [] if fast_incremental_default else [edge_by_id[edge_id] for edge_id in active_edge_ids]
-            round_edge_ids: list[int] | None = active_edge_ids
+            if fast_incremental_default:
+                round_edges = []
+                round_edge_ids: np.ndarray | list[int] | None = all_edge_ids
+            else:
+                active_ids_now = np.flatnonzero(active_edge_mask).astype(np.int64, copy=False)
+                round_edges = [edge_by_id[int(edge_id)] for edge_id in active_ids_now]
+                round_edge_ids = active_ids_now.tolist()
             support = None
         else:
             timer = time.perf_counter()
@@ -238,9 +245,32 @@ def relshift_prune(
             round_profile["bridge_count"] = int(guard_result.get("bridge_count", 0))
             round_profile["bridge_runtime_sec"] = float(guard_result["bridge_runtime_sec"])
             round_profile["tarjan_bridge_runtime_sec"] = round_profile["bridge_runtime_sec"] if config.guard_bridges else 0.0
+            round_profile["bridge_nodes_visited"] = int(guard_result.get("bridge_nodes_visited", 0))
+            round_profile["bridge_adjacency_entries_visited"] = int(
+                guard_result.get("bridge_adjacency_entries_visited", 0)
+            )
+            round_profile["bridge_inactive_adjacency_entries_skipped"] = int(
+                guard_result.get("bridge_inactive_adjacency_entries_skipped", 0)
+            )
             round_profile["eligibility_runtime_sec"] = float(guard_result["eligibility_runtime_sec"])
+            round_profile["active_edge_id_entries_scanned"] = int(
+                guard_result.get("active_edge_id_entries_scanned", len(round_edge_ids))
+            )
+            round_profile["inactive_edge_ids_skipped"] = int(guard_result.get("inactive_edge_ids_skipped", 0))
             round_profile["score_csr_runtime_sec"] = prebuilt_csr_runtime_sec
             round_profile["cache_partition_runtime_sec"] = float(guard_result.get("cache_partition_runtime_sec", 0.0))
+            if native_graph_state is not None and hasattr(native_graph_state, "storage_statistics"):
+                storage_stats = native_graph_state.storage_statistics()
+                round_profile["immutable_directed_adjacency_entries"] = int(
+                    storage_stats.get("immutable_directed_adjacency_entries", 0)
+                )
+                round_profile["active_directed_adjacency_entries"] = int(
+                    storage_stats.get("active_directed_adjacency_entries", 0)
+                )
+                round_profile["inactive_directed_adjacency_entries"] = int(
+                    storage_stats.get("inactive_directed_adjacency_entries", 0)
+                )
+                round_profile["tombstone_ratio_before"] = float(storage_stats.get("tombstone_ratio", 0.0))
         else:
             timer = time.perf_counter()
             bridges = (
@@ -619,17 +649,31 @@ def relshift_prune(
                 timer = time.perf_counter()
                 native_graph_state.remove_edge(int(removed_round[0][0]), int(removed_round[0][1]))
                 round_profile["native_graph_edge_removal_runtime_sec"] = float(time.perf_counter() - timer)
-            timer = time.perf_counter()
             removed_edge_ids = [edge_to_id[edge] for edge in removed_round]
-            removed_edge_id_set = set(removed_edge_ids)
-            active_edge_ids = [edge_id for edge_id in active_edge_ids if edge_id not in removed_edge_id_set]
-            round_profile["active_edge_list_rebuild_runtime_sec"] = float(time.perf_counter() - timer)
+            for removed_edge_id in removed_edge_ids:
+                if active_edge_mask[removed_edge_id] == 0:
+                    raise RuntimeError(f"Edge id {removed_edge_id} was removed twice.")
+                active_edge_mask[removed_edge_id] = 0
+                active_edge_count -= 1
+            round_profile["active_edge_list_rebuild_runtime_sec"] = 0.0
         else:
             timer = time.perf_counter()
             current_edges = remove_edge_pairs(current_edges, removed_round)
             round_profile["batch_edge_tensor_removal_runtime_sec"] = float(time.perf_counter() - timer)
         round_profile["remove_edge_runtime_sec"] = float(time.perf_counter() - remove_edge_block_start)
-        round_profile["active_edge_count_after"] = int(len(active_edge_ids) if is_incremental_sequential else current_edges.shape[1])
+        round_profile["active_edge_count_after"] = int(active_edge_count if is_incremental_sequential else current_edges.shape[1])
+        if native_graph_state is not None and hasattr(native_graph_state, "storage_statistics"):
+            storage_stats_after = native_graph_state.storage_statistics()
+            native_active_edge_count = int(storage_stats_after.get("active_edge_count", active_edge_count))
+            if native_active_edge_count != active_edge_count:
+                raise RuntimeError(
+                    "Python/native active-edge state diverged: "
+                    f"python={active_edge_count}, native={native_active_edge_count}."
+                )
+            round_profile["tombstone_ratio_after"] = float(storage_stats_after.get("tombstone_ratio", 0.0))
+            round_profile["inactive_directed_adjacency_entries_after"] = int(
+                storage_stats_after.get("inactive_directed_adjacency_entries", 0)
+            )
         round_profile["valid_score_cache_count_after"] = int(valid_score_cache.sum()) if is_incremental_sequential else int(len(score_cache))
         round_profile["delta_valid_cache_count_after"] = int(delta_valid_cache.sum()) if is_incremental_sequential else 0
         if profile_memory:
@@ -721,7 +765,7 @@ def relshift_prune(
                 "selected_update_runtime_sec": local_update_runtime_sec,
                 "avg_directly_attached_size": avg_directly_attached_size,
                 "avg_four_node_pair_count": avg_four_node_pair_count,
-                "remaining_edges": len(active_edge_ids) if is_incremental_sequential else int(current_edges.shape[1]),
+                "remaining_edges": active_edge_count if is_incremental_sequential else int(current_edges.shape[1]),
                 "removed_edges": [[edge[0], edge[1]] for edge in removed_round],
                 **local_update_summary,
                 **(round_profile if collect_runtime_profile else {}),
@@ -730,7 +774,7 @@ def relshift_prune(
         _relshift_log(
             verbose,
             f"[relshift] round={round_idx} removed={len(removed_round)} "
-            f"remaining_edges={len(active_edge_ids) if is_incremental_sequential else int(current_edges.shape[1])}",
+            f"remaining_edges={active_edge_count if is_incremental_sequential else int(current_edges.shape[1])}",
         )
 
     runtime = time.perf_counter() - start
@@ -742,7 +786,11 @@ def relshift_prune(
         _write_score_table(score_table_path, analysis_rows)
         score_table_write_runtime_sec = float(time.perf_counter() - score_table_write_start)
     total_runtime_including_score_write_sec = float(time.perf_counter() - start)
-    final_active_edges = [edge_by_id[edge_id] for edge_id in active_edge_ids] if is_incremental_sequential else active_edges
+    final_active_edges = (
+        [edge_by_id[int(edge_id)] for edge_id in np.flatnonzero(active_edge_mask)]
+        if is_incremental_sequential
+        else active_edges
+    )
     pruned_edge_index = _edges_tensor(final_active_edges) if is_incremental_sequential else current_edges
 
     peak_rss_end_mb = _peak_rss_mb() if profile_memory else None
@@ -757,6 +805,8 @@ def relshift_prune(
         candidate_delta_cache=candidate_delta_cache,
         delta_valid_cache=delta_valid_cache,
         invalidation_marks=invalidation_marks,
+        active_edge_mask=active_edge_mask,
+        all_edge_ids=all_edge_ids,
     )
     runtime_summary = _build_runtime_summary(
         bundle=bundle,
@@ -1380,7 +1430,7 @@ def _eligible_edge_id_partitions_incremental_native(
     *,
     row_ptr: np.ndarray | None,
     col_idx: np.ndarray | None,
-    active_edge_ids: list[int],
+    active_edge_ids: np.ndarray | list[int],
     edge_array_by_id: np.ndarray,
     degrees: np.ndarray,
     d_min: int,
@@ -1486,7 +1536,14 @@ def _eligible_edge_id_partitions_incremental_native(
         "blocked_by_d_min_count": int(result["blocked_by_d_min_count"]),
         "bridge_count": int(result.get("bridge_count", 0)),
         "bridge_runtime_sec": float(result["bridge_runtime_sec"]),
+        "bridge_nodes_visited": int(result.get("bridge_nodes_visited", 0)),
+        "bridge_adjacency_entries_visited": int(result.get("bridge_adjacency_entries_visited", 0)),
+        "bridge_inactive_adjacency_entries_skipped": int(
+            result.get("bridge_inactive_adjacency_entries_skipped", 0)
+        ),
         "eligibility_runtime_sec": float(result["eligibility_runtime_sec"]),
+        "active_edge_id_entries_scanned": int(result.get("active_edge_id_entries_scanned", len(active_edge_ids))),
+        "inactive_edge_ids_skipped": int(result.get("inactive_edge_ids_skipped", 0)),
         "cache_partition_runtime_sec": float(result.get("cache_partition_runtime_sec", 0.0)),
         "cached_best_edge_id": int(result.get("cached_best_edge_id", -1)),
     }
@@ -1496,7 +1553,7 @@ def _eligible_edge_ids_incremental_native(
     *,
     row_ptr: np.ndarray,
     col_idx: np.ndarray,
-    active_edge_ids: list[int],
+    active_edge_ids: np.ndarray | list[int],
     edge_array_by_id: np.ndarray,
     degrees: np.ndarray,
     d_min: int,
@@ -1881,6 +1938,8 @@ def _known_profile_state_bytes(
     candidate_delta_cache: np.ndarray,
     delta_valid_cache: np.ndarray,
     invalidation_marks: np.ndarray,
+    active_edge_mask: np.ndarray,
+    all_edge_ids: np.ndarray,
 ) -> dict[str, int]:
     components = {
         "edge_array_by_id_bytes": int(edge_array_by_id.nbytes),
@@ -1893,6 +1952,8 @@ def _known_profile_state_bytes(
         "candidate_delta_cache_bytes": int(candidate_delta_cache.nbytes),
         "delta_valid_mask_bytes": int(delta_valid_cache.nbytes),
         "invalidation_marks_bytes": int(invalidation_marks.nbytes),
+        "active_edge_mask_bytes": int(active_edge_mask.nbytes),
+        "all_edge_ids_bytes": int(all_edge_ids.nbytes),
     }
     components["known_numpy_state_total_bytes"] = int(sum(components.values()))
     return components
@@ -1968,6 +2029,11 @@ def _build_runtime_summary(
         "eligible_count",
         "blocked_by_bridge_count",
         "blocked_by_d_min_count",
+        "active_edge_id_entries_scanned",
+        "inactive_edge_ids_skipped",
+        "bridge_nodes_visited",
+        "bridge_adjacency_entries_visited",
+        "bridge_inactive_adjacency_entries_skipped",
         "rescored_edge_count",
         "scalar_refreshed_edge_count",
         "refresh_candidate_count",
@@ -1985,6 +2051,22 @@ def _build_runtime_summary(
         + totals["scalar_refreshed_edge_count"]
         + totals["reused_score_count"]
     )
+    candidate_delta_bytes = int(known_state_bytes.get("candidate_delta_cache_bytes", 0))
+    bytes_per_edge_candidate_delta = candidate_delta_bytes / max(bundle.num_edges, 1)
+    known_edge_state_keys = [
+        "score_cache_bytes",
+        "degree_score_cache_bytes",
+        "support_score_cache_bytes",
+        "valid_score_mask_bytes",
+        "candidate_delta_cache_bytes",
+        "delta_valid_mask_bytes",
+        "invalidation_marks_bytes",
+        "active_edge_mask_bytes",
+        "all_edge_ids_bytes",
+        "edge_array_by_id_bytes",
+    ]
+    known_edge_state_bytes = int(sum(int(known_state_bytes.get(key, 0)) for key in known_edge_state_keys))
+    known_edge_state_bytes_per_edge = known_edge_state_bytes / max(bundle.num_edges, 1)
 
     peak_values = [
         float(value)
@@ -2061,13 +2143,35 @@ def _build_runtime_summary(
             "max_update_union_size": int(max((int(row.get("update_union_size", 0)) for row in round_summaries), default=0)),
             "mean_bridge_count": _mean_round_metric(round_summaries, "bridge_count"),
         },
+        "scaling_work": {
+            "total_active_edge_id_entries_scanned": totals["active_edge_id_entries_scanned"],
+            "total_inactive_edge_ids_skipped": totals["inactive_edge_ids_skipped"],
+            "total_bridge_nodes_visited": totals["bridge_nodes_visited"],
+            "total_bridge_adjacency_entries_visited": totals["bridge_adjacency_entries_visited"],
+            "total_bridge_inactive_adjacency_entries_skipped": totals[
+                "bridge_inactive_adjacency_entries_skipped"
+            ],
+            "mean_tombstone_ratio_before": _mean_round_metric(round_summaries, "tombstone_ratio_before"),
+            "mean_tombstone_ratio_after": _mean_round_metric(round_summaries, "tombstone_ratio_after"),
+            "max_tombstone_ratio_after": float(
+                max((float(row.get("tombstone_ratio_after", 0.0)) for row in round_summaries), default=0.0)
+            ),
+        },
         "memory": {
             "peak_rss_start_mb": peak_rss_start_mb,
             "peak_rss_end_mb": peak_rss_end_mb,
             "peak_rss_observed_mb": max(peak_values) if peak_values else None,
             **known_state_bytes,
             "known_numpy_state_total_mib": known_state_bytes.get("known_numpy_state_total_bytes", 0) / (1024.0 * 1024.0),
-            "note": "Known-state bytes exclude Python container overhead, native CSR capacity, and allocator fragmentation.",
+            "candidate_delta_cache_bytes_per_edge": bytes_per_edge_candidate_delta,
+            "known_edge_state_bytes_per_edge": known_edge_state_bytes_per_edge,
+            "candidate_delta_cache_gib_at_1m_edges": bytes_per_edge_candidate_delta * 1_000_000 / (1024.0**3),
+            "candidate_delta_cache_gib_at_10m_edges": bytes_per_edge_candidate_delta * 10_000_000 / (1024.0**3),
+            "candidate_delta_cache_gib_at_60m_edges": bytes_per_edge_candidate_delta * 60_000_000 / (1024.0**3),
+            "known_edge_state_gib_at_1m_edges": known_edge_state_bytes_per_edge * 1_000_000 / (1024.0**3),
+            "known_edge_state_gib_at_10m_edges": known_edge_state_bytes_per_edge * 10_000_000 / (1024.0**3),
+            "known_edge_state_gib_at_60m_edges": known_edge_state_bytes_per_edge * 60_000_000 / (1024.0**3),
+            "note": "Known-state bytes exclude Python container overhead, native immutable CSR capacity, and allocator fragmentation.",
         },
         "environment": {
             "python_version": sys.version.split()[0],
@@ -2115,6 +2219,16 @@ def _write_runtime_profile_artifacts(
         "blocked_by_bridge_count",
         "blocked_by_d_min_count",
         "bridge_count",
+        "bridge_nodes_visited",
+        "bridge_adjacency_entries_visited",
+        "bridge_inactive_adjacency_entries_skipped",
+        "active_edge_id_entries_scanned",
+        "inactive_edge_ids_skipped",
+        "immutable_directed_adjacency_entries",
+        "active_directed_adjacency_entries",
+        "inactive_directed_adjacency_entries",
+        "tombstone_ratio_before",
+        "tombstone_ratio_after",
         "rescored_edge_count",
         "scalar_refreshed_edge_count",
         "refresh_candidate_count",

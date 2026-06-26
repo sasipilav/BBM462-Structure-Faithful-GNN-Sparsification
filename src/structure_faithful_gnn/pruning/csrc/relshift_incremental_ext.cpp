@@ -149,11 +149,25 @@ inline std::pair<int, int> decode_pair(const uint64_t code) {
     return {low, high};
 }
 
+inline bool adjacency_entry_is_active(
+    const int64_t adjacency_index,
+    const int64_t* adjacency_edge_ids,
+    const uint8_t* active_edge_mask
+) {
+    if (adjacency_edge_ids == nullptr || active_edge_mask == nullptr) {
+        return true;
+    }
+    const int64_t edge_id = adjacency_edge_ids[adjacency_index];
+    return edge_id >= 0 && active_edge_mask[edge_id] != 0;
+}
+
 int edge_support(
     const int64_t* row_ptr,
     const int64_t* col_idx,
     const int u,
-    const int v
+    const int v,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     int64_t left = row_ptr[u];
     int64_t left_stop = row_ptr[u + 1];
@@ -161,6 +175,21 @@ int edge_support(
     int64_t right_stop = row_ptr[v + 1];
     int count = 0;
     while (left < left_stop && right < right_stop) {
+        while (
+            left < left_stop &&
+            !adjacency_entry_is_active(left, adjacency_edge_ids, active_edge_mask)
+        ) {
+            ++left;
+        }
+        while (
+            right < right_stop &&
+            !adjacency_entry_is_active(right, adjacency_edge_ids, active_edge_mask)
+        ) {
+            ++right;
+        }
+        if (left >= left_stop || right >= right_stop) {
+            break;
+        }
         const int64_t left_node = col_idx[left];
         const int64_t right_node = col_idx[right];
         if (left_node == right_node) {
@@ -197,7 +226,9 @@ void collect_attached_nodes(
     std::vector<int>& marks,
     std::vector<int>& attachment_masks,
     std::vector<int>& directly_attached,
-    int& epoch
+    int& epoch,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     ++epoch;
     directly_attached.clear();
@@ -217,9 +248,15 @@ void collect_attached_nodes(
         directly_attached.push_back(node);
     };
     for (int64_t idx = row_ptr[u]; idx < row_ptr[u + 1]; ++idx) {
+        if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+            continue;
+        }
         add_node(static_cast<int>(col_idx[idx]), kUAEdgeBit);
     }
     for (int64_t idx = row_ptr[v]; idx < row_ptr[v + 1]; ++idx) {
+        if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+            continue;
+        }
         add_node(static_cast<int>(col_idx[idx]), kVAEdgeBit);
     }
 }
@@ -230,7 +267,9 @@ int collect_two_hop_size(
     const int u,
     const int v,
     std::vector<int>& marks,
-    int& epoch
+    int& epoch,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     ++epoch;
     int count = 0;
@@ -248,6 +287,9 @@ int collect_two_hop_size(
     frontier.reserve(32);
     for (const int seed : {u, v}) {
         for (int64_t idx = row_ptr[seed]; idx < row_ptr[seed + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             const int neighbor = static_cast<int>(col_idx[idx]);
             if (marks[neighbor] != epoch) {
                 marks[neighbor] = epoch;
@@ -258,6 +300,9 @@ int collect_two_hop_size(
     }
     for (const int node : frontier) {
         for (int64_t idx = row_ptr[node]; idx < row_ptr[node + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             const int neighbor = static_cast<int>(col_idx[idx]);
             mark_node(neighbor);
         }
@@ -271,7 +316,9 @@ std::vector<int> collect_two_hop_nodes_sorted(
     const int u,
     const int v,
     std::vector<int>& marks,
-    int& epoch
+    int& epoch,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     ++epoch;
     std::vector<int> touched;
@@ -290,6 +337,9 @@ std::vector<int> collect_two_hop_nodes_sorted(
     frontier.reserve(32);
     for (const int seed : {u, v}) {
         for (int64_t idx = row_ptr[seed]; idx < row_ptr[seed + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             const int neighbor = static_cast<int>(col_idx[idx]);
             if (marks[neighbor] != epoch) {
                 marks[neighbor] = epoch;
@@ -300,6 +350,9 @@ std::vector<int> collect_two_hop_nodes_sorted(
     }
     for (const int node : frontier) {
         for (int64_t idx = row_ptr[node]; idx < row_ptr[node + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             mark_node(static_cast<int>(col_idx[idx]));
         }
     }
@@ -349,7 +402,9 @@ void collect_relevant_pair_masks(
     const std::vector<int>& attachment_masks,
     const int epoch,
     std::vector<PairCode>& encoded_pairs,
-    std::vector<PairMask>& pair_masks
+    std::vector<PairMask>& pair_masks,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     encoded_pairs.clear();
     pair_masks.clear();
@@ -369,6 +424,9 @@ void collect_relevant_pair_masks(
     }
     for (const int a : directly_attached) {
         for (int64_t idx = row_ptr[a]; idx < row_ptr[a + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             add_pair(a, static_cast<int>(col_idx[idx]), kABEdgeBit);
         }
     }
@@ -435,7 +493,9 @@ void count_relevant_four_node_masks_combinatorial(
     const std::vector<int>& marks,
     const std::vector<int>& attachment_masks,
     const int epoch,
-    std::array<int64_t, 64>& mask_counts
+    std::array<int64_t, 64>& mask_counts,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     mask_counts.fill(0);
 
@@ -484,6 +544,9 @@ void count_relevant_four_node_masks_combinatorial(
     // that are only relevant when the a-b edge exists.
     for (const int node : directly_attached) {
         for (int64_t idx = row_ptr[node]; idx < row_ptr[node + 1]; ++idx) {
+            if (!adjacency_entry_is_active(idx, adjacency_edge_ids, active_edge_mask)) {
+                continue;
+            }
             const int neighbor = static_cast<int>(col_idx[idx]);
             if (neighbor == u || neighbor == v || neighbor == node) {
                 continue;
@@ -682,10 +745,23 @@ ScoreResult score_single_edge_mask_count(
     double* pair_generation_sec = nullptr,
     double* delta_accumulation_sec = nullptr,
     double* score_scalarization_sec = nullptr,
-    int64_t* endpoint_delta_out = nullptr
+    int64_t* endpoint_delta_out = nullptr,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
     const auto pair_start = pair_generation_sec == nullptr ? std::chrono::steady_clock::time_point{} : std::chrono::steady_clock::now();
-    collect_attached_nodes(row_ptr, col_idx, u, v, marks, attachment_masks, directly_attached, epoch);
+    collect_attached_nodes(
+        row_ptr,
+        col_idx,
+        u,
+        v,
+        marks,
+        attachment_masks,
+        directly_attached,
+        epoch,
+        adjacency_edge_ids,
+        active_edge_mask
+    );
     count_relevant_four_node_masks_combinatorial(
         row_ptr,
         col_idx,
@@ -695,7 +771,9 @@ ScoreResult score_single_edge_mask_count(
         marks,
         attachment_masks,
         epoch,
-        four_node_mask_counts
+        four_node_mask_counts,
+        adjacency_edge_ids,
+        active_edge_mask
     );
     if (pair_generation_sec != nullptr) {
         *pair_generation_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_start).count();
@@ -719,7 +797,16 @@ ScoreResult score_single_edge_mask_count(
     copy_endpoint_delta_to_int_cache(endpoint_delta.data(), endpoint_delta_out);
 
     const int update_size = include_update_sizes
-        ? collect_two_hop_size(row_ptr, col_idx, u, v, marks, epoch)
+        ? collect_two_hop_size(
+            row_ptr,
+            col_idx,
+            u,
+            v,
+            marks,
+            epoch,
+            adjacency_edge_ids,
+            active_edge_mask
+        )
         : 0;
     if (delta_accumulation_sec != nullptr) {
         *delta_accumulation_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - delta_start).count();
@@ -868,26 +955,36 @@ py::dict score_edges_round(
     return result;
 }
 
-py::dict compute_selected_edge_delta(
-    py::array_t<int64_t, py::array::c_style | py::array::forcecast> row_ptr_array,
-    py::array_t<int64_t, py::array::c_style | py::array::forcecast> col_idx_array,
+py::dict compute_selected_edge_delta_impl(
+    const int64_t* row_ptr,
+    const int64_t* col_idx,
+    const int num_nodes,
     const int u,
-    const int v
+    const int v,
+    const int64_t* adjacency_edge_ids = nullptr,
+    const uint8_t* active_edge_mask = nullptr
 ) {
-    const auto row_ptr = row_ptr_array.unchecked<1>();
-    const auto col_idx = col_idx_array.unchecked<1>();
-    const int num_nodes = static_cast<int>(row_ptr.shape(0) - 1);
-
     std::vector<int> marks(static_cast<size_t>(num_nodes), 0);
     std::vector<int> attachment_masks(static_cast<size_t>(num_nodes), 0);
     std::vector<int> directly_attached;
     std::vector<PairCode> encoded_pairs;
     std::vector<PairMask> pair_masks;
     int epoch = 0;
-    collect_attached_nodes(row_ptr.data(0), col_idx.data(0), u, v, marks, attachment_masks, directly_attached, epoch);
+    collect_attached_nodes(
+        row_ptr,
+        col_idx,
+        u,
+        v,
+        marks,
+        attachment_masks,
+        directly_attached,
+        epoch,
+        adjacency_edge_ids,
+        active_edge_mask
+    );
     collect_relevant_pair_masks(
-        row_ptr.data(0),
-        col_idx.data(0),
+        row_ptr,
+        col_idx,
         u,
         v,
         directly_attached,
@@ -895,9 +992,20 @@ py::dict compute_selected_edge_delta(
         attachment_masks,
         epoch,
         encoded_pairs,
-        pair_masks
+        pair_masks,
+        adjacency_edge_ids,
+        active_edge_mask
     );
-    auto affected_nodes = collect_two_hop_nodes_sorted(row_ptr.data(0), col_idx.data(0), u, v, marks, epoch);
+    auto affected_nodes = collect_two_hop_nodes_sorted(
+        row_ptr,
+        col_idx,
+        u,
+        v,
+        marks,
+        epoch,
+        adjacency_edge_ids,
+        active_edge_mask
+    );
 
     std::unordered_map<int, int> affected_index;
     affected_index.reserve(affected_nodes.size() * 2U + 1U);
@@ -979,6 +1087,23 @@ py::dict compute_selected_edge_delta(
     result["directly_attached_size"] = static_cast<int64_t>(directly_attached.size());
     result["four_node_pair_count"] = static_cast<int64_t>(pair_masks.size());
     return result;
+}
+
+py::dict compute_selected_edge_delta(
+    py::array_t<int64_t, py::array::c_style | py::array::forcecast> row_ptr_array,
+    py::array_t<int64_t, py::array::c_style | py::array::forcecast> col_idx_array,
+    const int u,
+    const int v
+) {
+    const auto row_ptr = row_ptr_array.unchecked<1>();
+    const auto col_idx = col_idx_array.unchecked<1>();
+    return compute_selected_edge_delta_impl(
+        row_ptr.data(0),
+        col_idx.data(0),
+        static_cast<int>(row_ptr.shape(0) - 1),
+        u,
+        v
+    );
 }
 
 py::dict eligible_edge_ids_from_csr(
@@ -1478,6 +1603,11 @@ public:
             }
         }
         num_nodes_ = static_cast<int>(row_ptr_.size() - 1);
+        current_degrees_.assign(static_cast<size_t>(num_nodes_), 0);
+        for (int node = 0; node < num_nodes_; ++node) {
+            current_degrees_[static_cast<size_t>(node)] =
+                row_ptr_[static_cast<size_t>(node + 1)] - row_ptr_[static_cast<size_t>(node)];
+        }
     }
 
     void initialize_edge_ids(
@@ -1506,6 +1636,25 @@ public:
             incident_edge_ids_[static_cast<size_t>(left)].push_back(static_cast<int64_t>(edge_id));
             incident_edge_ids_[static_cast<size_t>(right)].push_back(static_cast<int64_t>(edge_id));
         }
+        adjacency_edge_ids_.assign(col_idx_.size(), static_cast<int64_t>(-1));
+        for (int node = 0; node < num_nodes_; ++node) {
+            for (
+                int64_t idx = row_ptr_[static_cast<size_t>(node)];
+                idx < row_ptr_[static_cast<size_t>(node + 1)];
+                ++idx
+            ) {
+                const int neighbor = static_cast<int>(col_idx_[static_cast<size_t>(idx)]);
+                const auto found = edge_code_to_id_.find(encode_pair(node, neighbor));
+                if (found == edge_code_to_id_.end()) {
+                    throw std::runtime_error(
+                        "CSR contains an adjacency entry that is missing from edge_array_by_id."
+                    );
+                }
+                adjacency_edge_ids_[static_cast<size_t>(idx)] = found->second;
+            }
+        }
+        original_edge_count_ = static_cast<int64_t>(edge_by_id_.size());
+        active_edge_count_ = original_edge_count_;
         has_edge_ids_ = true;
     }
 
@@ -1591,6 +1740,9 @@ public:
 
         using Clock = std::chrono::high_resolution_clock;
         std::unordered_set<uint64_t> bridge_codes;
+        int64_t bridge_nodes_visited = 0;
+        int64_t bridge_adjacency_entries_visited = 0;
+        int64_t bridge_inactive_adjacency_entries_skipped = 0;
         const auto bridge_start = Clock::now();
         if (guard_bridges) {
             std::vector<int> discovery(static_cast<size_t>(num_nodes_), -1);
@@ -1599,10 +1751,20 @@ public:
             int visit_time = 0;
             bridge_codes.reserve(static_cast<size_t>(active_edge_ids.shape(0) / 8 + 1));
             std::function<void(int)> visit = [&](const int node) {
+                ++bridge_nodes_visited;
                 discovery[static_cast<size_t>(node)] = visit_time;
                 low[static_cast<size_t>(node)] = visit_time;
                 ++visit_time;
                 for (int64_t idx = row_ptr_[static_cast<size_t>(node)]; idx < row_ptr_[static_cast<size_t>(node + 1)]; ++idx) {
+                    ++bridge_adjacency_entries_visited;
+                    if (!adjacency_entry_is_active(
+                            idx,
+                            adjacency_edge_ids_.data(),
+                            active_edge_mask_.data()
+                        )) {
+                        ++bridge_inactive_adjacency_entries_skipped;
+                        continue;
+                    }
                     const int neighbor = static_cast<int>(col_idx_[static_cast<size_t>(idx)]);
                     if (discovery[static_cast<size_t>(neighbor)] == -1) {
                         parent[static_cast<size_t>(neighbor)] = node;
@@ -1641,6 +1803,8 @@ public:
         refresh_ids.reserve(static_cast<size_t>(active_edge_ids.shape(0) / 4 + 1));
         int64_t blocked_by_bridge = 0;
         int64_t blocked_by_d_min = 0;
+        int64_t active_edge_id_entries_scanned = 0;
+        int64_t inactive_edge_ids_skipped = 0;
         bool has_cached_best = false;
         EdgeKey cached_best{0.0, 0.0, 0.0, -1};
 
@@ -1659,11 +1823,13 @@ public:
         };
 
         for (ssize_t idx = 0; idx < active_edge_ids.shape(0); ++idx) {
+            ++active_edge_id_entries_scanned;
             const int64_t edge_id = active_edge_ids(idx);
             if (edge_id < 0 || edge_id >= static_cast<int64_t>(edge_by_id_.size())) {
                 throw std::runtime_error("active_edge_ids contains invalid edge id.");
             }
             if (active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
+                ++inactive_edge_ids_skipped;
                 continue;
             }
             const int u = edge_by_id_[static_cast<size_t>(edge_id)][0];
@@ -1710,7 +1876,12 @@ public:
         result["blocked_by_d_min_count"] = blocked_by_d_min;
         result["bridge_count"] = static_cast<int64_t>(bridge_codes.size());
         result["bridge_runtime_sec"] = bridge_runtime_sec;
+        result["bridge_nodes_visited"] = bridge_nodes_visited;
+        result["bridge_adjacency_entries_visited"] = bridge_adjacency_entries_visited;
+        result["bridge_inactive_adjacency_entries_skipped"] = bridge_inactive_adjacency_entries_skipped;
         result["eligibility_runtime_sec"] = eligibility_runtime_sec;
+        result["active_edge_id_entries_scanned"] = active_edge_id_entries_scanned;
+        result["inactive_edge_ids_skipped"] = inactive_edge_ids_skipped;
         result["cache_partition_runtime_sec"] = 0.0;
         result["cached_best_edge_id"] = static_cast<int64_t>(has_cached_best ? cached_best.edge_id : -1);
         return result;
@@ -1734,10 +1905,8 @@ public:
         py::object candidate_delta_cache_object = py::none(),
         py::object delta_valid_cache_object = py::none()
     ) const {
-        return score_edges_round_best(
-            row_ptr_array(),
-            col_idx_array(),
-            candidate_edges_array,
+        (void)candidate_edges_array;
+        return score_edge_ids_round_best(
             candidate_edge_ids_array,
             current_raw_array,
             current_std_array,
@@ -1861,12 +2030,23 @@ public:
                 local_pair_generation_sec,
                 local_delta_accumulation_sec,
                 local_score_scalarization_sec,
-                endpoint_delta_cache.data()
+                endpoint_delta_cache.data(),
+                adjacency_edge_ids_.data(),
+                active_edge_mask_.data()
             );
             const double degree_score =
-                static_cast<double>((row_ptr_[static_cast<size_t>(u + 1)] - row_ptr_[static_cast<size_t>(u)]) +
-                                    (row_ptr_[static_cast<size_t>(v + 1)] - row_ptr_[static_cast<size_t>(v)]));
-            const double support_score = static_cast<double>(edge_support(row_ptr_.data(), col_idx_.data(), u, v));
+                static_cast<double>(
+                    current_degrees_[static_cast<size_t>(u)] +
+                    current_degrees_[static_cast<size_t>(v)]
+                );
+            const double support_score = static_cast<double>(edge_support(
+                row_ptr_.data(),
+                col_idx_.data(),
+                u,
+                v,
+                adjacency_edge_ids_.data(),
+                active_edge_mask_.data()
+            ));
 
             score_cache(edge_id) = scored.score;
             degree_score_cache(edge_id) = degree_score;
@@ -2050,9 +2230,18 @@ public:
                 endpoint_delta
             );
             const double degree_score =
-                static_cast<double>((row_ptr_[static_cast<size_t>(u + 1)] - row_ptr_[static_cast<size_t>(u)]) +
-                                    (row_ptr_[static_cast<size_t>(v + 1)] - row_ptr_[static_cast<size_t>(v)]));
-            const double support_score = static_cast<double>(edge_support(row_ptr_.data(), col_idx_.data(), u, v));
+                static_cast<double>(
+                    current_degrees_[static_cast<size_t>(u)] +
+                    current_degrees_[static_cast<size_t>(v)]
+                );
+            const double support_score = static_cast<double>(edge_support(
+                row_ptr_.data(),
+                col_idx_.data(),
+                u,
+                v,
+                adjacency_edge_ids_.data(),
+                active_edge_mask_.data()
+            ));
             score_cache(edge_id) = scored.score;
             degree_score_cache(edge_id) = degree_score;
             support_score_cache(edge_id) = support_score;
@@ -2074,7 +2263,15 @@ public:
     }
 
     py::dict compute_selected_edge_delta_state(const int u, const int v) const {
-        return compute_selected_edge_delta(row_ptr_array(), col_idx_array(), u, v);
+        return compute_selected_edge_delta_impl(
+            row_ptr_.data(),
+            col_idx_.data(),
+            num_nodes_,
+            u,
+            v,
+            adjacency_edge_ids_.data(),
+            active_edge_mask_.data()
+        );
     }
 
     py::dict compute_selected_edge_delta_and_invalidate(
@@ -2089,7 +2286,15 @@ public:
         }
         const int u = edge_by_id_[static_cast<size_t>(selected_edge_id)][0];
         const int v = edge_by_id_[static_cast<size_t>(selected_edge_id)][1];
-        py::dict result = compute_selected_edge_delta(row_ptr_array(), col_idx_array(), u, v);
+        py::dict result = compute_selected_edge_delta_impl(
+            row_ptr_.data(),
+            col_idx_.data(),
+            num_nodes_,
+            u,
+            v,
+            adjacency_edge_ids_.data(),
+            active_edge_mask_.data()
+        );
 
         auto valid_score_cache = valid_score_cache_array.mutable_unchecked<1>();
         auto affected_nodes_array = result["affected_nodes"].cast<py::array_t<int64_t, py::array::c_style | py::array::forcecast>>();
@@ -2191,7 +2396,18 @@ public:
         std::vector<PairCode> encoded_pairs;
         std::vector<PairMask> pair_masks;
         int epoch = 0;
-        collect_attached_nodes(row_ptr_.data(), col_idx_.data(), u, v, marks, attachment_masks, directly_attached, epoch);
+        collect_attached_nodes(
+            row_ptr_.data(),
+            col_idx_.data(),
+            u,
+            v,
+            marks,
+            attachment_masks,
+            directly_attached,
+            epoch,
+            adjacency_edge_ids_.data(),
+            active_edge_mask_.data()
+        );
         collect_relevant_pair_masks(
             row_ptr_.data(),
             col_idx_.data(),
@@ -2202,9 +2418,20 @@ public:
             attachment_masks,
             epoch,
             encoded_pairs,
-            pair_masks
+            pair_masks,
+            adjacency_edge_ids_.data(),
+            active_edge_mask_.data()
         );
-        auto affected_nodes = collect_two_hop_nodes_sorted(row_ptr_.data(), col_idx_.data(), u, v, marks, epoch);
+        auto affected_nodes = collect_two_hop_nodes_sorted(
+            row_ptr_.data(),
+            col_idx_.data(),
+            u,
+            v,
+            marks,
+            epoch,
+            adjacency_edge_ids_.data(),
+            active_edge_mask_.data()
+        );
 
         std::unordered_map<int, int> affected_index;
         affected_index.reserve(affected_nodes.size() * 2U + 1U);
@@ -2399,21 +2626,57 @@ public:
     }
 
     void remove_edge(const int u, const int v) {
-        const bool removed_uv = remove_neighbor(u, v);
-        const bool removed_vu = remove_neighbor(v, u);
-        if (!removed_uv || !removed_vu) {
+        if (!has_edge_ids_) {
+            throw std::runtime_error("NativeGraphState logical removal requires edge id state.");
+        }
+        const auto found = edge_code_to_id_.find(encode_pair(u, v));
+        if (found == edge_code_to_id_.end()) {
+            throw std::runtime_error("NativeGraphState remove_edge called for an unknown undirected edge.");
+        }
+        const int64_t edge_id = found->second;
+        if (edge_id < 0 || edge_id >= static_cast<int64_t>(active_edge_mask_.size())) {
+            throw std::runtime_error("NativeGraphState edge id is outside active mask range.");
+        }
+        if (active_edge_mask_[static_cast<size_t>(edge_id)] == 0) {
             throw std::runtime_error("NativeGraphState remove_edge called for a non-active undirected edge.");
         }
-        if (has_edge_ids_) {
-            const auto found = edge_code_to_id_.find(encode_pair(u, v));
-            if (found != edge_code_to_id_.end()) {
-                active_edge_mask_[static_cast<size_t>(found->second)] = 0;
-            }
+        active_edge_mask_[static_cast<size_t>(edge_id)] = 0;
+        const auto& edge = edge_by_id_[static_cast<size_t>(edge_id)];
+        if (current_degrees_[static_cast<size_t>(edge[0])] <= 0 || current_degrees_[static_cast<size_t>(edge[1])] <= 0) {
+            throw std::runtime_error("NativeGraphState degree underflow during logical edge removal.");
         }
+        --current_degrees_[static_cast<size_t>(edge[0])];
+        --current_degrees_[static_cast<size_t>(edge[1])];
+        --active_edge_count_;
     }
 
     int64_t directed_edge_count() const {
+        return active_edge_count_ * 2;
+    }
+
+    int64_t immutable_directed_adjacency_entry_count() const {
         return static_cast<int64_t>(col_idx_.size());
+    }
+
+    int64_t active_edge_count() const {
+        return active_edge_count_;
+    }
+
+    py::dict storage_statistics() const {
+        const int64_t immutable_directed_entries = static_cast<int64_t>(col_idx_.size());
+        const int64_t active_directed_entries = active_edge_count_ * 2;
+        const int64_t inactive_directed_entries = immutable_directed_entries - active_directed_entries;
+        py::dict result;
+        result["original_edge_count"] = original_edge_count_;
+        result["active_edge_count"] = active_edge_count_;
+        result["inactive_edge_count"] = original_edge_count_ - active_edge_count_;
+        result["immutable_directed_adjacency_entries"] = immutable_directed_entries;
+        result["active_directed_adjacency_entries"] = active_directed_entries;
+        result["inactive_directed_adjacency_entries"] = inactive_directed_entries;
+        result["tombstone_ratio"] = immutable_directed_entries == 0
+            ? 0.0
+            : static_cast<double>(inactive_directed_entries) / static_cast<double>(immutable_directed_entries);
+        return result;
     }
 
     int num_nodes() const {
@@ -2421,6 +2684,14 @@ public:
     }
 
 private:
+    const int64_t* adjacency_edge_ids_ptr() const {
+        return has_edge_ids_ ? adjacency_edge_ids_.data() : nullptr;
+    }
+
+    const uint8_t* active_edge_mask_ptr() const {
+        return has_edge_ids_ ? active_edge_mask_.data() : nullptr;
+    }
+
     py::array_t<int64_t> row_ptr_array() const {
         return py::array_t<int64_t>(static_cast<ssize_t>(row_ptr_.size()), row_ptr_.data());
     }
@@ -2429,27 +2700,14 @@ private:
         return py::array_t<int64_t>(static_cast<ssize_t>(col_idx_.size()), col_idx_.data());
     }
 
-    bool remove_neighbor(const int row, const int neighbor) {
-        if (row < 0 || row >= num_nodes_) {
-            return false;
-        }
-        auto begin = col_idx_.begin() + row_ptr_[static_cast<size_t>(row)];
-        auto end = col_idx_.begin() + row_ptr_[static_cast<size_t>(row + 1)];
-        auto found = std::lower_bound(begin, end, static_cast<int64_t>(neighbor));
-        if (found == end || *found != static_cast<int64_t>(neighbor)) {
-            return false;
-        }
-        col_idx_.erase(found);
-        for (size_t idx = static_cast<size_t>(row + 1); idx < row_ptr_.size(); ++idx) {
-            --row_ptr_[idx];
-        }
-        return true;
-    }
-
     int num_nodes_ = 0;
     std::vector<int64_t> row_ptr_;
     std::vector<int64_t> col_idx_;
+    std::vector<int64_t> adjacency_edge_ids_;
+    std::vector<int64_t> current_degrees_;
     bool has_edge_ids_ = false;
+    int64_t original_edge_count_ = 0;
+    int64_t active_edge_count_ = 0;
     std::vector<std::array<int, 2>> edge_by_id_;
     std::unordered_map<uint64_t, int64_t> edge_code_to_id_;
     std::vector<std::vector<int64_t>> incident_edge_ids_;
@@ -2531,6 +2789,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("compute_selected_edge_delta_and_update_candidate_cache", &NativeGraphState::compute_selected_edge_delta_and_update_candidate_cache, py::arg("selected_edge_id"), py::arg("valid_score_cache"), py::arg("delta_valid_cache"), py::arg("candidate_delta_cache"))
         .def("remove_edge", &NativeGraphState::remove_edge, py::arg("u"), py::arg("v"))
         .def("directed_edge_count", &NativeGraphState::directed_edge_count)
+        .def("immutable_directed_adjacency_entry_count", &NativeGraphState::immutable_directed_adjacency_entry_count)
+        .def("active_edge_count", &NativeGraphState::active_edge_count)
+        .def("storage_statistics", &NativeGraphState::storage_statistics)
         .def("num_nodes", &NativeGraphState::num_nodes);
 
     module.def("score_edges_round", &score_edges_round, py::arg("row_ptr"), py::arg("col_idx"), py::arg("candidate_edges"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("include_update_sizes") = true);

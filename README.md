@@ -243,3 +243,24 @@ Each measured run writes:
 - `pruning_result.json`, `pruned_edges.pt`, and `removed_edges.pt`: the corresponding exact pruning result.
 
 The aggregate files `profile_runs.csv` and `profile_runs.json` compare repeated measured runs. `profile_native_kernel: true` exposes native sub-kernel timings but disables the normal parallel scoring path, so it should be used as a separate diagnostic run rather than mixed with production runtime measurements.
+
+## Phase 1 step 2: immutable active-mask graph storage
+
+The exact incremental engine now keeps the initial CSR adjacency immutable. Stable edge IDs are mapped to every directed adjacency entry, and an edge deletion only:
+
+- clears `active_edge_mask[edge_id]`,
+- decrements the two endpoint degrees,
+- decrements the active-edge counter.
+
+Native graphlet, support, two-hop, and bridge traversals skip inactive adjacency entries through the mask. The Python engine also keeps a fixed `all_edge_ids` array and no longer rebuilds the active-edge ID list after every deletion. This preserves the reference sequential pruning semantics while removing CSR element shifts and per-round active-list copies.
+
+The runtime profiler now also records scale-sensitive work that may be small on Cora but grow sharply on larger graphs:
+
+- active edge-ID entries scanned and inactive IDs skipped,
+- bridge nodes and adjacency entries visited,
+- inactive adjacency entries skipped during bridge traversal,
+- immutable/active/inactive directed adjacency counts,
+- tombstone ratios,
+- candidate-delta and total known edge-state memory projections at 1M, 10M, and 60M edges.
+
+`active_edge_list_rebuild_runtime_sec` is retained for before/after compatibility and is zero on the immutable active-mask path.
