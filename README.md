@@ -347,3 +347,18 @@ On the validated Cora setup it preserved the complete deletion sequence and redu
 
 - `docs/phase1_step35_exact_engine_optimization.md`
 - `docs/phase1_step35_validation.json`
+
+
+## Phase 1 steps 4 and 5: exact validation and scaling
+
+The optimized exact engine is now covered by an independent validation chain rather than backend-to-backend comparison alone. The permanent suite includes exhaustive five-node orbit-delta checks, a brute-force greedy oracle, a 240-run production configuration matrix, cache-on/cache-off trajectory checks, and controlled synthetic scaling with exact initial GDVs.
+
+A floating-point tie regression discovered by the wide matrix was fixed by routing all exact score paths through `canonical_native_raw_log1p_v1`. Current validation and scaling reports are available in:
+
+- `docs/phase1_step4_exact_equivalence.md`
+- `docs/phase1_step4_validation.json`
+- `docs/phase1_step5_reprofiling_scaling.md`
+- `docs/phase1_step5_validation.json`
+- `docs/phase1_exact_engine_completion.md`
+
+Raw matrices are stored under `results/phase1_exact_engine/`.

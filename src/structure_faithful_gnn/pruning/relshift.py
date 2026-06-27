@@ -117,7 +117,15 @@ def relshift_prune(
     effective_recompute_rounds = len(round_budgets)
     relshift_engine = _resolve_relshift_engine(requested_relshift_engine, round_budgets=round_budgets)
     is_incremental_sequential = relshift_engine == "incremental_sequential_exact"
-    candidate_delta_cache_enabled = bool(is_incremental_sequential and use_score_cache and not write_edge_scores)
+    candidate_delta_cache_requested = bool(
+        (config.options or {}).get("candidate_delta_cache_enabled", True)
+    )
+    candidate_delta_cache_enabled = bool(
+        candidate_delta_cache_requested
+        and is_incremental_sequential
+        and use_score_cache
+        and not write_edge_scores
+    )
     candidate_delta_cache_mode = "mixed_correction" if candidate_delta_cache_enabled else "off"
     original_region_edge_map = (
         None
@@ -1382,6 +1390,7 @@ def relshift_prune(
             "requested_relshift_engine": requested_relshift_engine,
             "incremental_backend": "native_cpp_extension" if relshift_engine == "incremental_sequential_exact" else "",
             "score_norm": score_norm,
+            "score_scalarization_kernel": "canonical_native_raw_log1p_v1",
             "score_node_scope": "edge_endpoints_only",
             "round_state_update_mode": "single_edge_exact_incremental" if relshift_engine == "incremental_sequential_exact" else "union_two_hop_exact_local_recount",
             "score_reuse_mode": "cache_with_local_invalidation" if use_score_cache else "full_rescore_per_round",
@@ -1411,6 +1420,8 @@ def relshift_prune(
             "versioned_heap_statistics": final_heap_stats if use_versioned_heap else None,
             "profile_native_kernel": profile_native_kernel,
             "native_omp_threads_requested": native_omp_threads,
+            "candidate_delta_cache_requested": bool(candidate_delta_cache_requested),
+            "candidate_delta_cache_enabled": bool(candidate_delta_cache_enabled),
             "candidate_delta_cache_mode": candidate_delta_cache_mode,
             "delta_cache_valid_count": int(delta_valid_cache.sum()) if is_incremental_sequential else 0,
             "scalar_refresh_edge_count": int(sum(int(row.get("scalar_refreshed_edge_count", 0)) for row in round_summaries)),

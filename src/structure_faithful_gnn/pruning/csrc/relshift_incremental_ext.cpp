@@ -33,6 +33,15 @@ constexpr int kVAEdgeBit = 8;
 constexpr int kVBEdgeBit = 16;
 constexpr int kABEdgeBit = 32;
 
+inline double canonical_standardized_coordinate(
+    const double raw_value,
+    const double mean,
+    const double standard_deviation
+) {
+    const double clamped_raw = std::max(raw_value, 0.0);
+    return (std::log1p(clamped_raw) - mean) / standard_deviation;
+}
+
 using OrbitRow = std::array<int8_t, 4>;
 
 struct PairMask {
@@ -760,10 +769,10 @@ ScoreResult score_from_internal_endpoint_delta(
     const std::string& score_mode,
     const int64_t* endpoint_delta
 ) {
-    // Preserve the reference scalarization operation order exactly.  Although
-    // the normalization mean cancels algebraically in the numerator, using the
-    // already materialized standardized state avoids introducing tiny floating
-    // point differences that could alter a near-tie in the greedy edge order.
+    // Canonical exact scalarization: recompute both base and counterfactual
+    // standardized coordinates from raw counts in the same C++ kernel.  Mixing
+    // a NumPy-produced base value with std::log1p counterfactual values can
+    // create implementation-only 1e-15 differences and break edge-id ties.
     double absolute_sum = 0.0;
     double relative_sum = 0.0;
     double denom_sum = 0.0;
@@ -774,15 +783,22 @@ ScoreResult score_from_internal_endpoint_delta(
         double endpoint_l1 = 0.0;
         for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
             const size_t coordinate = static_cast<size_t>(row_offset + orbit_idx);
-            const double base_raw = current_raw[coordinate];
+            const double base_raw = std::max(current_raw[coordinate], 0.0);
+            const double base_std = canonical_standardized_coordinate(
+                base_raw,
+                stats_mean[static_cast<size_t>(orbit_idx)],
+                stats_std[static_cast<size_t>(orbit_idx)]
+            );
             const double candidate_raw = std::max(
                 base_raw + static_cast<double>(endpoint_delta[local_idx * kOrbitDim + orbit_idx]),
                 0.0
             );
-            const double candidate_std = (
-                std::log1p(candidate_raw) - stats_mean[static_cast<size_t>(orbit_idx)]
-            ) / stats_std[static_cast<size_t>(orbit_idx)];
-            endpoint_l1 += std::abs(current_std[coordinate] - candidate_std);
+            const double candidate_std = canonical_standardized_coordinate(
+                candidate_raw,
+                stats_mean[static_cast<size_t>(orbit_idx)],
+                stats_std[static_cast<size_t>(orbit_idx)]
+            );
+            endpoint_l1 += std::abs(base_std - candidate_std);
         }
         const double endpoint_denom = node_denominator[static_cast<size_t>(node)];
         absolute_sum += endpoint_l1;
@@ -825,15 +841,22 @@ double endpoint_score_from_internal_delta_masked(
         const int orbit_idx = __builtin_ctz(static_cast<unsigned int>(mask));
         mask = static_cast<uint16_t>(mask & static_cast<uint16_t>(mask - 1));
         const size_t coordinate = static_cast<size_t>(row_offset + orbit_idx);
-        const double base_raw = current_raw[coordinate];
+        const double base_raw = std::max(current_raw[coordinate], 0.0);
+        const double base_std = canonical_standardized_coordinate(
+            base_raw,
+            stats_mean[static_cast<size_t>(orbit_idx)],
+            stats_std[static_cast<size_t>(orbit_idx)]
+        );
         const double candidate_raw = std::max(
             base_raw + static_cast<double>(endpoint_delta[local_idx * kOrbitDim + orbit_idx]),
             0.0
         );
-        const double candidate_std = (
-            std::log1p(candidate_raw) - stats_mean[static_cast<size_t>(orbit_idx)]
-        ) / stats_std[static_cast<size_t>(orbit_idx)];
-        endpoint_l1 += std::abs(current_std[coordinate] - candidate_std);
+        const double candidate_std = canonical_standardized_coordinate(
+            candidate_raw,
+            stats_mean[static_cast<size_t>(orbit_idx)],
+            stats_std[static_cast<size_t>(orbit_idx)]
+        );
+        endpoint_l1 += std::abs(base_std - candidate_std);
     }
     return score_mode == "absolute"
         ? endpoint_l1
@@ -865,15 +888,22 @@ ScoreResult score_from_internal_endpoint_delta_masked(
             const int orbit_idx = __builtin_ctz(static_cast<unsigned int>(mask));
             mask = static_cast<uint16_t>(mask & static_cast<uint16_t>(mask - 1));
             const size_t coordinate = static_cast<size_t>(row_offset + orbit_idx);
-            const double base_raw = current_raw[coordinate];
+            const double base_raw = std::max(current_raw[coordinate], 0.0);
+            const double base_std = canonical_standardized_coordinate(
+                base_raw,
+                stats_mean[static_cast<size_t>(orbit_idx)],
+                stats_std[static_cast<size_t>(orbit_idx)]
+            );
             const double candidate_raw = std::max(
                 base_raw + static_cast<double>(endpoint_delta[local_idx * kOrbitDim + orbit_idx]),
                 0.0
             );
-            const double candidate_std = (
-                std::log1p(candidate_raw) - stats_mean[static_cast<size_t>(orbit_idx)]
-            ) / stats_std[static_cast<size_t>(orbit_idx)];
-            endpoint_l1 += std::abs(current_std[coordinate] - candidate_std);
+            const double candidate_std = canonical_standardized_coordinate(
+                candidate_raw,
+                stats_mean[static_cast<size_t>(orbit_idx)],
+                stats_std[static_cast<size_t>(orbit_idx)]
+            );
+            endpoint_l1 += std::abs(base_std - candidate_std);
         }
         const double endpoint_denom = node_denominator[static_cast<size_t>(node)];
         absolute_sum += endpoint_l1;
@@ -954,12 +984,17 @@ ScoreResult score_from_endpoint_delta_cache(
         double endpoint_l1 = 0.0;
         double base_l1 = 0.0;
         for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+            const double base_raw = std::max(current_raw(node, orbit_idx), 0.0);
+            const double base_std = canonical_standardized_coordinate(
+                base_raw, stats_mean(orbit_idx), stats_std(orbit_idx)
+            );
             const double candidate_raw =
-                std::max(current_raw(node, orbit_idx) + static_cast<double>(endpoint_delta[local_idx * kOrbitDim + orbit_idx]), 0.0);
-            const double candidate_std =
-                (std::log1p(candidate_raw) - stats_mean(orbit_idx)) / stats_std(orbit_idx);
-            endpoint_l1 += std::abs(current_std(node, orbit_idx) - candidate_std);
-            base_l1 += std::abs(current_std(node, orbit_idx));
+                std::max(base_raw + static_cast<double>(endpoint_delta[local_idx * kOrbitDim + orbit_idx]), 0.0);
+            const double candidate_std = canonical_standardized_coordinate(
+                candidate_raw, stats_mean(orbit_idx), stats_std(orbit_idx)
+            );
+            endpoint_l1 += std::abs(base_std - candidate_std);
+            base_l1 += std::abs(base_std);
         }
         const double endpoint_denom = base_l1 + eps;
         absolute_sum += endpoint_l1;
@@ -1041,6 +1076,8 @@ void accumulate_full_delta_for_mask_dense(
     }
 }
 
+// All exact candidate scorers use this same raw-to-standardized operation
+// order.  The StdView argument remains for API compatibility and diagnostics.
 template <typename RawView, typename StdView, typename MeanView, typename StdStatsView>
 ScoreResult score_single_edge_mask_count(
     const int64_t* row_ptr,
@@ -1139,12 +1176,17 @@ ScoreResult score_single_edge_mask_count(
         double endpoint_l1 = 0.0;
         double base_l1 = 0.0;
         for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+            const double base_raw = std::max(current_raw(node, orbit_idx), 0.0);
+            const double base_std = canonical_standardized_coordinate(
+                base_raw, stats_mean(orbit_idx), stats_std(orbit_idx)
+            );
             const double candidate_raw =
-                std::max(current_raw(node, orbit_idx) + endpoint_delta[local_idx * kOrbitDim + orbit_idx], 0.0);
-            const double candidate_std =
-                (std::log1p(candidate_raw) - stats_mean(orbit_idx)) / stats_std(orbit_idx);
-            endpoint_l1 += std::abs(current_std(node, orbit_idx) - candidate_std);
-            base_l1 += std::abs(current_std(node, orbit_idx));
+                std::max(base_raw + endpoint_delta[local_idx * kOrbitDim + orbit_idx], 0.0);
+            const double candidate_std = canonical_standardized_coordinate(
+                candidate_raw, stats_mean(orbit_idx), stats_std(orbit_idx)
+            );
+            endpoint_l1 += std::abs(base_std - candidate_std);
+            base_l1 += std::abs(base_std);
         }
         const double endpoint_denom = base_l1 + eps;
         absolute_sum += endpoint_l1;
@@ -2066,9 +2108,11 @@ public:
             for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
                 const size_t offset = static_cast<size_t>(node * kOrbitDim + orbit_idx);
                 const double raw_value = std::max(current_raw(node, orbit_idx), 0.0);
-                const double standardized =
-                    (std::log1p(raw_value) - stats_mean_state_[static_cast<size_t>(orbit_idx)])
-                    / stats_std_state_[static_cast<size_t>(orbit_idx)];
+                const double standardized = canonical_standardized_coordinate(
+                    raw_value,
+                    stats_mean_state_[static_cast<size_t>(orbit_idx)],
+                    stats_std_state_[static_cast<size_t>(orbit_idx)]
+                );
                 current_raw_state_[offset] = raw_value;
                 current_std_state_[offset] = standardized;
                 denominator += std::abs(standardized);
@@ -2832,9 +2876,11 @@ public:
                     current_raw_state_[offset] + raw_delta[delta_offset + static_cast<size_t>(orbit_idx)],
                     0.0
                 );
-                const double updated_std =
-                    (std::log1p(updated_raw) - stats_mean_state_[static_cast<size_t>(orbit_idx)])
-                    / stats_std_state_[static_cast<size_t>(orbit_idx)];
+                const double updated_std = canonical_standardized_coordinate(
+                    updated_raw,
+                    stats_mean_state_[static_cast<size_t>(orbit_idx)],
+                    stats_std_state_[static_cast<size_t>(orbit_idx)]
+                );
                 current_raw_state_[offset] = updated_raw;
                 current_std_state_[offset] = updated_std;
                 denominator += std::abs(updated_std);
@@ -2930,6 +2976,51 @@ public:
         delta_result.attr("pop")("raw_delta", py::none());
         delta_result.attr("pop")("impacted_edges", py::none());
         return delta_result;
+    }
+
+    py::array_t<int64_t> candidate_delta_cache_snapshot() const {
+        if (!relshift_state_initialized_) {
+            throw std::runtime_error("RelShift state is not initialized.");
+        }
+        py::array_t<int64_t> result(py::array::ShapeContainer{
+            static_cast<ssize_t>(original_edge_count_),
+            static_cast<ssize_t>(2),
+            static_cast<ssize_t>(kOrbitDim)
+        });
+        auto* output = static_cast<int64_t*>(result.mutable_data());
+        if (candidate_delta_cache_state_.empty()) {
+            std::fill(output, output + static_cast<size_t>(original_edge_count_) * 2U * kOrbitDim, 0);
+        } else {
+            std::copy(candidate_delta_cache_state_.begin(), candidate_delta_cache_state_.end(), output);
+        }
+        return result;
+    }
+
+    py::array_t<uint8_t> delta_valid_cache_snapshot() const {
+        if (!relshift_state_initialized_) {
+            throw std::runtime_error("RelShift state is not initialized.");
+        }
+        py::array_t<uint8_t> result(static_cast<ssize_t>(delta_valid_cache_state_.size()));
+        std::copy(delta_valid_cache_state_.begin(), delta_valid_cache_state_.end(), static_cast<uint8_t*>(result.mutable_data()));
+        return result;
+    }
+
+    py::array_t<uint8_t> valid_score_cache_snapshot() const {
+        if (!relshift_state_initialized_) {
+            throw std::runtime_error("RelShift state is not initialized.");
+        }
+        py::array_t<uint8_t> result(static_cast<ssize_t>(valid_score_cache_state_.size()));
+        std::copy(valid_score_cache_state_.begin(), valid_score_cache_state_.end(), static_cast<uint8_t*>(result.mutable_data()));
+        return result;
+    }
+
+    py::array_t<double> score_cache_snapshot() const {
+        if (!relshift_state_initialized_) {
+            throw std::runtime_error("RelShift state is not initialized.");
+        }
+        py::array_t<double> result(static_cast<ssize_t>(score_cache_state_.size()));
+        std::copy(score_cache_state_.begin(), score_cache_state_.end(), static_cast<double*>(result.mutable_data()));
+        return result;
     }
 
     py::array_t<double> current_raw_snapshot() const {
@@ -3052,6 +3143,27 @@ public:
             candidate_delta_nonzero_mask_state_.size() * sizeof(uint16_t)
         );
         result["delta_valid_cache_bytes"] = static_cast<int64_t>(delta_valid_cache_state_.size() * sizeof(uint8_t));
+        const int64_t numeric_state_bytes = static_cast<int64_t>(
+            current_raw_state_.size() * sizeof(double)
+            + current_std_state_.size() * sizeof(double)
+            + node_denominator_state_.size() * sizeof(double)
+            + graphlet_marks_workspace_.size() * sizeof(int)
+            + graphlet_attachment_workspace_.size() * sizeof(int)
+            + node_workspace_epoch_.size() * sizeof(uint32_t)
+            + node_workspace_index_.size() * sizeof(int)
+            + selected_raw_delta_workspace_.capacity() * sizeof(double)
+            + selected_pair_masks_workspace_.capacity() * sizeof(PairMask)
+            + score_cache_state_.size() * sizeof(double)
+            + endpoint_score_cache_state_.size() * sizeof(double)
+            + endpoint_score_valid_mask_state_.size() * sizeof(uint8_t)
+            + degree_score_cache_state_.size() * sizeof(double)
+            + support_score_cache_state_.size() * sizeof(double)
+            + valid_score_cache_state_.size() * sizeof(uint8_t)
+            + candidate_delta_cache_state_.size() * sizeof(int64_t)
+            + candidate_delta_nonzero_mask_state_.size() * sizeof(uint16_t)
+            + delta_valid_cache_state_.size() * sizeof(uint8_t)
+        );
+        result["native_numeric_state_total_bytes"] = numeric_state_bytes;
         result["valid_score_count"] = static_cast<int64_t>(std::count(
             valid_score_cache_state_.begin(), valid_score_cache_state_.end(), static_cast<uint8_t>(1)
         ));
@@ -5409,6 +5521,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("commit_dirty_heap_keys_fused", &NativeGraphState::commit_dirty_heap_keys_fused, py::arg("rebuild_ratio") = 4.0)
         .def("select_best_edge_fused", &NativeGraphState::select_best_edge_fused, py::arg("d_min"), py::arg("guard_bridges"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("rebuild_ratio") = 4.0, py::arg("bridge_maintenance_mode") = "global_tarjan", py::arg("heap_storage_mode") = "versioned")
         .def("apply_selected_edge_and_remove_fused", &NativeGraphState::apply_selected_edge_and_remove_fused, py::arg("selected_edge_id"), py::arg("adjacency_compaction_threshold") = 0.20)
+        .def("candidate_delta_cache_snapshot", &NativeGraphState::candidate_delta_cache_snapshot)
+        .def("delta_valid_cache_snapshot", &NativeGraphState::delta_valid_cache_snapshot)
+        .def("score_cache_snapshot", &NativeGraphState::score_cache_snapshot)
+        .def("valid_score_cache_snapshot", &NativeGraphState::valid_score_cache_snapshot)
         .def("current_raw_snapshot", &NativeGraphState::current_raw_snapshot)
         .def("current_std_snapshot", &NativeGraphState::current_std_snapshot)
         .def("active_edge_mask_snapshot", &NativeGraphState::active_edge_mask_snapshot)

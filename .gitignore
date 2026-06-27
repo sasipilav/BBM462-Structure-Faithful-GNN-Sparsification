@@ -14,6 +14,6 @@ venv/
 results.zip
 results-csv/
 report/
+tests/
 docs/
 pytest.ini
-tests/
