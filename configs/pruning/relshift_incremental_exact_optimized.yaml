@@ -1,0 +1,26 @@
+method: relshift
+rho: 0.05
+score_mode: relative
+d_min: 2
+guard_bridges: true
+backend: orca
+eps: 1.0e-8
+
+relshift_engine: incremental_sequential_exact
+use_score_cache: true
+write_edge_scores: false
+use_native_graph_state: true
+native_state_fusion: true
+
+incremental_selection_backend: versioned_heap
+heap_storage_mode: indexed
+heap_rebuild_ratio: 4.0
+bridge_maintenance_mode: lazy_exact
+adjacency_compaction_threshold: 0.20
+
+profile_rounds: false
+write_runtime_profile: false
+profile_memory: false
+profile_update_diagnostics: false
+profile_native_kernel: false
+native_omp_threads: 1

@@ -323,3 +323,27 @@ Additional profiler fields include:
 - heap auxiliary-state and rebuild-bound memory projections.
 
 Validated Cora results and the exactness argument are documented in `docs/phase1_step3_versioned_heap.md` and `docs/phase1_step3_validation.json`.
+
+## Phase 1 step 3.5: optimized exact engine
+
+The exact sequential engine now provides an optimized fused configuration:
+
+```yaml
+native_state_fusion: true
+incremental_selection_backend: versioned_heap
+heap_storage_mode: indexed
+bridge_maintenance_mode: lazy_exact
+adjacency_compaction_threshold: 0.20
+```
+
+Ready-to-run configurations:
+
+- `configs/pruning/relshift_incremental_exact_optimized.yaml`
+- `configs/pruning/relshift_incremental_exact_optimized_profile.yaml`
+
+The optimized path fuses GDV/candidate state into the native engine, maintains triangle support incrementally, caches endpoint contributions and node denominators, skips zero orbit-delta coordinates, uses reusable epoch workspaces, removes selected-pair sort/unique materialization, verifies bridges lazily and exactly, compacts tombstones deterministically, and uses a one-entry-per-edge indexed heap.
+
+On the validated Cora setup it preserved the complete deletion sequence and reduced round runtime by approximately `2.35x` at `rho=0.10` and `2.62x` at `rho=0.30` relative to the Phase 1 Step 3 active-mask/versioned-heap reference. Exactness arguments, implementation details, limitations, and benchmark methodology are documented in:
+
+- `docs/phase1_step35_exact_engine_optimization.md`
+- `docs/phase1_step35_validation.json`

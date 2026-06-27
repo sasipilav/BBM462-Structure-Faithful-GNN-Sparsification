@@ -73,6 +73,7 @@ def relshift_prune(
     profile_label = str((config.options or {}).get("profile_label", "")).strip()
     peak_rss_start_mb = _peak_rss_mb() if profile_memory else None
     use_native_graph_state = bool((config.options or {}).get("use_native_graph_state", True))
+    native_state_fusion_requested = bool((config.options or {}).get("native_state_fusion", True))
     incremental_selection_backend = str(
         (config.options or {}).get("incremental_selection_backend", "linear_scan")
     ).strip().lower()
@@ -83,6 +84,25 @@ def relshift_prune(
     heap_rebuild_ratio = float((config.options or {}).get("heap_rebuild_ratio", 4.0))
     if heap_rebuild_ratio < 1.0:
         raise ValueError("heap_rebuild_ratio must be at least 1.0.")
+    heap_storage_mode = str(
+        (config.options or {}).get("heap_storage_mode", "versioned")
+    ).strip().lower()
+    if heap_storage_mode not in {"versioned", "indexed"}:
+        raise ValueError("heap_storage_mode must be one of: versioned, indexed.")
+    adjacency_compaction_threshold = float(
+        (config.options or {}).get("adjacency_compaction_threshold", 0.20)
+    )
+    if not 0.0 <= adjacency_compaction_threshold < 1.0:
+        raise ValueError("adjacency_compaction_threshold must be in [0, 1).")
+    bridge_maintenance_mode = str(
+        (config.options or {}).get("bridge_maintenance_mode", "global_tarjan")
+    ).strip().lower()
+    if bridge_maintenance_mode not in {"global_tarjan", "lazy_exact"}:
+        raise ValueError(
+            "bridge_maintenance_mode must be one of: global_tarjan, lazy_exact."
+        )
+    if bridge_maintenance_mode == "lazy_exact" and not native_state_fusion_requested:
+        raise ValueError("lazy_exact bridge maintenance requires native_state_fusion=true.")
     profile_native_kernel = bool((config.options or {}).get("profile_native_kernel", False))
     native_omp_threads = int((config.options or {}).get("native_omp_threads", 0) or 0)
     if native_omp_threads < 0:
@@ -132,47 +152,111 @@ def relshift_prune(
 
     state_initialization_start = time.perf_counter()
     removed_total: list[tuple[int, int]] = []
+    removed_total_count = 0
     round_summaries: list[dict[str, object]] = []
     analysis_rows: list[dict[str, object]] = []
     score_cache: dict[tuple[int, int], EdgeScore] = {}
     invalidated_score_edges: set[tuple[int, int]] = set()
-    active_edges = [tuple(edge) for edge in bundle.edge_index.t().tolist()]
-    edge_by_id = list(active_edges)
-    edge_array_by_id = np.asarray(edge_by_id, dtype=np.int64).reshape((-1, 2)) if edge_by_id else np.empty((0, 2), dtype=np.int64)
-    edge_to_id = {edge: edge_id for edge_id, edge in enumerate(edge_by_id)}
-    all_edge_ids = np.arange(len(edge_by_id), dtype=np.int64)
-    active_edge_mask = np.ones(len(edge_by_id), dtype=np.uint8)
-    active_edge_count = len(edge_by_id)
-    incident_edge_ids: list[list[int]] = [[] for _ in range(bundle.num_nodes)]
-    for edge_id, (u, v) in enumerate(edge_by_id):
-        incident_edge_ids[u].append(edge_id)
-        incident_edge_ids[v].append(edge_id)
-    score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
-    degree_score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
-    support_score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
-    valid_score_cache = np.zeros(len(edge_by_id), dtype=np.uint8)
-    candidate_delta_cache = np.zeros((len(edge_by_id), 2, 15), dtype=np.int64)
-    delta_valid_cache = np.zeros(len(edge_by_id), dtype=np.uint8)
-    current_adjacency = adjacency_sets(bundle.num_nodes, bundle.edge_index)
-    current_degrees = np.asarray([len(neighbors) for neighbors in current_adjacency], dtype=np.int64)
     fast_incremental_default = is_incremental_sequential and not write_edge_scores
-    native_graph_state = None
-    initial_native_graph_state_runtime_sec = 0.0
-    if fast_incremental_default and use_native_graph_state:
-        timer = time.perf_counter()
-        initial_row_ptr, initial_col_idx = _adjacency_to_csr(current_adjacency)
-        native_graph_state = _create_native_graph_state(initial_row_ptr, initial_col_idx, edge_array_by_id)
-        initial_native_graph_state_runtime_sec = float(time.perf_counter() - timer)
-    if candidate_delta_cache_enabled and native_graph_state is None:
-        raise RuntimeError("mixed-correction candidate delta cache requires persistent native graph state.")
     use_versioned_heap = bool(
         fast_incremental_default and incremental_selection_backend == "versioned_heap"
     )
+    use_native_fused_state = bool(use_versioned_heap and native_state_fusion_requested)
+    if heap_storage_mode == "indexed" and not use_native_fused_state:
+        raise ValueError("heap_storage_mode=indexed requires native_state_fusion=true and versioned_heap selection.")
+    native_graph_state = None
+    initial_native_graph_state_runtime_sec = 0.0
+
+    # The fused path never materializes Python tuple lists or adjacency sets.
+    # Stable edge ids preserve the input row order; a separately sorted directed
+    # CSR supports exact intersections in the native engine.
+    if use_native_fused_state:
+        timer = time.perf_counter()
+        edge_array_by_id, initial_row_ptr, initial_col_idx, current_degrees = _edge_index_to_native_csr(
+            bundle.num_nodes,
+            bundle.edge_index,
+        )
+        active_edge_count = int(edge_array_by_id.shape[0])
+        active_edges: list[tuple[int, int]] = []
+        edge_by_id: list[tuple[int, int]] = []
+        active_edge_mask = np.empty(0, dtype=np.uint8)
+        current_adjacency: list[set[int]] = []
+        edge_to_id: dict[tuple[int, int], int] = {}
+        all_edge_ids = np.empty(0, dtype=np.int64)
+        incident_edge_ids: list[list[int]] = []
+        score_cache_values = np.empty(0, dtype=np.float64)
+        degree_score_cache_values = np.empty(0, dtype=np.float64)
+        support_score_cache_values = np.empty(0, dtype=np.float64)
+        valid_score_cache = np.empty(0, dtype=np.uint8)
+        candidate_delta_cache = np.empty((0, 2, 15), dtype=np.int64)
+        delta_valid_cache = np.empty(0, dtype=np.uint8)
+        invalidation_marks = np.empty(0, dtype=np.uint32)
+        if use_native_graph_state:
+            native_graph_state = _create_native_graph_state(
+                initial_row_ptr,
+                initial_col_idx,
+                edge_array_by_id,
+            )
+        initial_native_graph_state_runtime_sec = float(time.perf_counter() - timer)
+    else:
+        active_edges = [tuple(edge) for edge in bundle.edge_index.t().tolist()]
+        edge_by_id = list(active_edges)
+        edge_array_by_id = (
+            np.asarray(edge_by_id, dtype=np.int64).reshape((-1, 2))
+            if edge_by_id
+            else np.empty((0, 2), dtype=np.int64)
+        )
+        active_edge_mask = np.ones(len(edge_by_id), dtype=np.uint8)
+        active_edge_count = len(edge_by_id)
+        edge_to_id = {edge: edge_id for edge_id, edge in enumerate(edge_by_id)}
+        all_edge_ids = np.arange(len(edge_by_id), dtype=np.int64)
+        incident_edge_ids = [[] for _ in range(bundle.num_nodes)]
+        for edge_id, (u, v) in enumerate(edge_by_id):
+            incident_edge_ids[u].append(edge_id)
+            incident_edge_ids[v].append(edge_id)
+        score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
+        degree_score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
+        support_score_cache_values = np.full(len(edge_by_id), np.inf, dtype=np.float64)
+        valid_score_cache = np.zeros(len(edge_by_id), dtype=np.uint8)
+        candidate_delta_cache = np.zeros((len(edge_by_id), 2, 15), dtype=np.int64)
+        delta_valid_cache = np.zeros(len(edge_by_id), dtype=np.uint8)
+        invalidation_marks = np.zeros(len(edge_by_id), dtype=np.uint32)
+        current_adjacency = adjacency_sets(bundle.num_nodes, bundle.edge_index)
+        current_degrees = np.asarray(
+            [len(neighbors) for neighbors in current_adjacency], dtype=np.int64
+        )
+        if fast_incremental_default and use_native_graph_state:
+            timer = time.perf_counter()
+            initial_row_ptr, initial_col_idx = _adjacency_to_csr(current_adjacency)
+            native_graph_state = _create_native_graph_state(
+                initial_row_ptr,
+                initial_col_idx,
+                edge_array_by_id,
+            )
+            initial_native_graph_state_runtime_sec = float(time.perf_counter() - timer)
+    if candidate_delta_cache_enabled and native_graph_state is None:
+        raise RuntimeError("mixed-correction candidate delta cache requires persistent native graph state.")
     if use_versioned_heap and native_graph_state is None:
         raise RuntimeError("versioned_heap selection requires persistent NativeGraphState.")
     if use_versioned_heap and not use_score_cache:
         raise RuntimeError("versioned_heap selection requires use_score_cache=true.")
-    invalidation_marks = np.zeros(len(edge_by_id), dtype=np.uint32)
+    if use_native_fused_state:
+        native_graph_state.initialize_relshift_state(
+            current_raw,
+            stats.mean,
+            stats.std,
+            config.score_mode,
+            float(config.eps),
+            bool(candidate_delta_cache_enabled),
+        )
+        # NativeGraphState is now the sole owner of the evolving numerical and
+        # adjacency state.  Empty compatibility arrays make accidental use in a
+        # fused branch fail loudly instead of silently maintaining a duplicate.
+        current_raw = np.empty((0, 15), dtype=np.float64)
+        current_std = np.empty((0, 15), dtype=np.float64)
+        current_adjacency = []
+        edge_array_by_id = np.empty((0, 2), dtype=np.int64)
+        del original_raw
     invalidation_epoch = 1
     pruning_state_initialization_runtime_sec = float(time.perf_counter() - state_initialization_start)
 
@@ -225,6 +309,7 @@ def relshift_prune(
         native_refresh_edge_ids: list[int] = []
         native_reused_count = 0
         native_cached_best_edge_id = -1
+        fused_selection_result: dict[str, object] | None = None
         prebuilt_csr: tuple[np.ndarray, np.ndarray] | None = None
         prebuilt_csr_runtime_sec = 0.0
         if fast_incremental_default:
@@ -236,27 +321,43 @@ def relshift_prune(
                 prebuilt_csr_runtime_sec = float(time.perf_counter() - timer)
             if use_versioned_heap:
                 heap_guard_start = time.perf_counter()
-                raw_guard_result = native_graph_state.prepare_versioned_heap_round(
-                    int(config.d_min),
-                    bool(config.guard_bridges),
-                    valid_score_cache,
-                    delta_valid_cache if candidate_delta_cache_enabled else None,
-                )
-                guard_result = {
-                    "eligible_edge_ids": [],
-                    "rescored_edge_ids": [
+                if use_native_fused_state:
+                    raw_guard_result = native_graph_state.select_best_edge_fused(
+                        int(config.d_min),
+                        bool(config.guard_bridges),
+                        native_kernel_variant,
+                        bool(profile_native_kernel),
+                        float(heap_rebuild_ratio),
+                        bridge_maintenance_mode,
+                        heap_storage_mode,
+                    )
+                    fused_selection_result = dict(raw_guard_result)
+                    rescored_ids_for_round: list[int] = []
+                    refresh_ids_for_round: list[int] = []
+                else:
+                    raw_guard_result = native_graph_state.prepare_versioned_heap_round(
+                        int(config.d_min),
+                        bool(config.guard_bridges),
+                        valid_score_cache,
+                        delta_valid_cache if candidate_delta_cache_enabled else None,
+                    )
+                    rescored_ids_for_round = [
                         int(edge_id)
                         for edge_id in np.asarray(
                             raw_guard_result["rescored_edge_ids"], dtype=np.int64
                         ).tolist()
-                    ],
-                    "reused_edge_ids": [],
-                    "refresh_edge_ids": [
+                    ]
+                    refresh_ids_for_round = [
                         int(edge_id)
                         for edge_id in np.asarray(
                             raw_guard_result["refresh_edge_ids"], dtype=np.int64
                         ).tolist()
-                    ],
+                    ]
+                guard_result = {
+                    "eligible_edge_ids": [],
+                    "rescored_edge_ids": rescored_ids_for_round,
+                    "reused_edge_ids": [],
+                    "refresh_edge_ids": refresh_ids_for_round,
                     "eligible_count": int(raw_guard_result["eligible_count"]),
                     "rescored_count": int(raw_guard_result["rescored_count"]),
                     "reused_count": int(raw_guard_result["reused_count"]),
@@ -287,6 +388,27 @@ def relshift_prune(
                     ),
                     "heap_size_before_update": int(
                         raw_guard_result.get("heap_size_before_update", 0)
+                    ),
+                    "lazy_bridge_queries": int(
+                        raw_guard_result.get("lazy_bridge_queries", 0)
+                    ),
+                    "lazy_bridge_support_certificates": int(
+                        raw_guard_result.get("lazy_bridge_support_certificates", 0)
+                    ),
+                    "lazy_bridge_nodes_visited": int(
+                        raw_guard_result.get("lazy_bridge_nodes_visited", 0)
+                    ),
+                    "lazy_bridge_adjacency_entries_visited": int(
+                        raw_guard_result.get("lazy_bridge_adjacency_entries_visited", 0)
+                    ),
+                    "lazy_bridge_inactive_entries_skipped": int(
+                        raw_guard_result.get("lazy_bridge_inactive_entries_skipped", 0)
+                    ),
+                    "lazy_bridges_rejected": int(
+                        raw_guard_result.get("lazy_bridges_rejected", 0)
+                    ),
+                    "lazy_bridge_runtime_sec": float(
+                        raw_guard_result.get("lazy_bridge_runtime_sec", 0.0)
                     ),
                     "cache_partition_runtime_sec": 0.0,
                     "cached_best_edge_id": -1,
@@ -322,7 +444,11 @@ def relshift_prune(
             guard_counts["d_min_guard"] = int(guard_result["blocked_by_d_min_count"])
             round_profile["bridge_count"] = int(guard_result.get("bridge_count", 0))
             round_profile["bridge_runtime_sec"] = float(guard_result["bridge_runtime_sec"])
-            round_profile["tarjan_bridge_runtime_sec"] = round_profile["bridge_runtime_sec"] if config.guard_bridges else 0.0
+            round_profile["tarjan_bridge_runtime_sec"] = (
+                round_profile["bridge_runtime_sec"]
+                if config.guard_bridges and bridge_maintenance_mode == "global_tarjan"
+                else 0.0
+            )
             round_profile["bridge_nodes_visited"] = int(guard_result.get("bridge_nodes_visited", 0))
             round_profile["bridge_adjacency_entries_visited"] = int(
                 guard_result.get("bridge_adjacency_entries_visited", 0)
@@ -342,6 +468,27 @@ def relshift_prune(
             round_profile["heap_size_before_update"] = int(guard_result.get("heap_size_before_update", 0))
             round_profile["heap_guard_wrapper_runtime_sec"] = float(
                 guard_result.get("heap_guard_wrapper_runtime_sec", 0.0)
+            )
+            round_profile["lazy_bridge_queries"] = int(
+                guard_result.get("lazy_bridge_queries", 0)
+            )
+            round_profile["lazy_bridge_support_certificates"] = int(
+                guard_result.get("lazy_bridge_support_certificates", 0)
+            )
+            round_profile["lazy_bridge_nodes_visited"] = int(
+                guard_result.get("lazy_bridge_nodes_visited", 0)
+            )
+            round_profile["lazy_bridge_adjacency_entries_visited"] = int(
+                guard_result.get("lazy_bridge_adjacency_entries_visited", 0)
+            )
+            round_profile["lazy_bridge_inactive_entries_skipped"] = int(
+                guard_result.get("lazy_bridge_inactive_entries_skipped", 0)
+            )
+            round_profile["lazy_bridges_rejected"] = int(
+                guard_result.get("lazy_bridges_rejected", 0)
+            )
+            round_profile["lazy_bridge_runtime_sec"] = float(
+                guard_result.get("lazy_bridge_runtime_sec", 0.0)
             )
             round_profile["score_csr_runtime_sec"] = prebuilt_csr_runtime_sec
             round_profile["cache_partition_runtime_sec"] = float(guard_result.get("cache_partition_runtime_sec", 0.0))
@@ -467,139 +614,231 @@ def relshift_prune(
         selected: list[EdgeScore] = []
         round_profile["best_selection_runtime_sec"] = 0.0
         if fast_incremental_selection:
-            refreshed_best_edge_id = None
-            if refresh_edge_ids:
-                (
-                    refreshed_best_edge_id,
-                    native_scalar_refresh_runtime_sec,
-                    scalar_refresh_profile,
-                ) = _refresh_incremental_scores_from_delta_cache(
-                    refresh_edge_ids=refresh_edge_ids,
-                    current_raw=current_raw,
-                    current_std=current_std,
-                    stats=stats,
-                    score_mode=config.score_mode,
-                    eps=config.eps,
-                    candidate_delta_cache=candidate_delta_cache,
-                    delta_valid_cache=delta_valid_cache,
-                    score_cache_values=score_cache_values,
-                    degree_score_cache_values=degree_score_cache_values,
-                    support_score_cache_values=support_score_cache_values,
-                    valid_score_cache=valid_score_cache,
-                    native_graph_state=native_graph_state,
-                )
-                scalar_refreshed_score_count = len(refresh_edge_ids)
-                round_profile.update(scalar_refresh_profile)
-            rescored_best_edge_id = None
-            if rescored_edge_ids:
-                (
-                    rescored_best_edge_id,
-                    native_score_runtime_sec,
-                    incremental_score_profile,
-                ) = _score_incremental_round_best(
-                    rescored_edge_ids=rescored_edge_ids,
-                    edge_array_by_id=edge_array_by_id,
-                    current_adjacency=current_adjacency,
-                    current_raw=current_raw,
-                    current_std=current_std,
-                    stats=stats,
-                    score_mode=config.score_mode,
-                    eps=config.eps,
-                    score_cache_values=score_cache_values,
-                    degree_score_cache_values=degree_score_cache_values,
-                    support_score_cache_values=support_score_cache_values,
-                    valid_score_cache=valid_score_cache,
-                    candidate_delta_cache=candidate_delta_cache if candidate_delta_cache_enabled else None,
-                    delta_valid_cache=delta_valid_cache if candidate_delta_cache_enabled else None,
-                    profile_native_kernel=profile_native_kernel,
-                    native_kernel_variant=native_kernel_variant,
-                    native_graph_state=native_graph_state,
-                    prebuilt_csr=prebuilt_csr,
-                    prebuilt_csr_runtime_sec=prebuilt_csr_runtime_sec,
-                )
-                _relshift_log(
-                    verbose,
-                    f"[relshift] round={round_idx} rescored={len(rescored_edge_ids)}/{len(rescored_edge_ids)} "
-                    f"reused={reused_score_count} native_score_sec={native_score_runtime_sec:.4f}",
-                )
-            else:
-                _relshift_log(verbose, f"[relshift] round={round_idx} rescored=0 reused={reused_score_count} native_score_sec=0.0000")
-            best_selection_start = time.perf_counter()
-            if use_versioned_heap:
-                heap_commit_result = native_graph_state.commit_dirty_heap_keys(
-                    score_cache_values,
-                    degree_score_cache_values,
-                    support_score_cache_values,
-                    valid_score_cache,
-                    float(heap_rebuild_ratio),
-                )
-                heap_pop_result = native_graph_state.pop_best_versioned_heap()
-                selected_edge_id_raw = int(heap_pop_result.get("selected_edge_id", -1))
+            if use_native_fused_state:
+                if fused_selection_result is None:
+                    raise RuntimeError("Fused native selection result is missing.")
+                selected_edge_id_raw = int(fused_selection_result.get("selected_edge_id", -1))
                 selected_edge_id = selected_edge_id_raw if selected_edge_id_raw >= 0 else None
+                if selected_edge_id is None:
+                    raise RuntimeError("Fused native RelShift could not select an eligible edge.")
+                scalar_refreshed_score_count = int(
+                    fused_selection_result.get("scalar_refreshed_edge_count", 0)
+                )
+                native_scalar_refresh_runtime_sec = float(
+                    fused_selection_result.get("native_scalar_refresh_runtime_sec", 0.0)
+                )
+                native_score_runtime_sec = float(
+                    fused_selection_result.get("native_score_runtime_sec", 0.0)
+                )
+                incremental_score_profile = {
+                    "avg_directly_attached_size": float(
+                        fused_selection_result.get("avg_directly_attached_size", 0.0)
+                    ),
+                    "avg_four_node_pair_count": float(
+                        fused_selection_result.get("avg_four_node_pair_count", 0.0)
+                    ),
+                    "native_pair_generation_runtime_sec": float(
+                        fused_selection_result.get("native_pair_generation_runtime_sec", 0.0)
+                    ),
+                    "native_delta_accumulation_runtime_sec": float(
+                        fused_selection_result.get("native_delta_accumulation_runtime_sec", 0.0)
+                    ),
+                    "native_score_scalarization_runtime_sec": float(
+                        fused_selection_result.get("native_score_scalarization_runtime_sec", 0.0)
+                    ),
+                }
+                round_profile.update(incremental_score_profile)
+                round_profile["scalar_refreshed_edge_count"] = scalar_refreshed_score_count
+                round_profile["scalar_refresh_nonzero_orbit_coordinates"] = int(
+                    fused_selection_result.get("scalar_refresh_nonzero_orbit_coordinates", 0)
+                )
                 round_profile["heap_update_runtime_sec"] = float(
-                    heap_commit_result.get("heap_update_runtime_sec", 0.0)
+                    fused_selection_result.get("heap_update_runtime_sec", 0.0)
                 )
                 round_profile["heap_pop_runtime_sec"] = float(
-                    heap_pop_result.get("heap_pop_runtime_sec", 0.0)
+                    fused_selection_result.get("heap_pop_runtime_sec", 0.0)
                 )
                 round_profile["heap_keys_pushed"] = int(
-                    heap_commit_result.get("heap_keys_pushed", 0)
+                    fused_selection_result.get("heap_keys_pushed", 0)
                 )
                 round_profile["heap_rebuilt"] = int(
-                    bool(heap_commit_result.get("heap_rebuilt", False))
+                    bool(fused_selection_result.get("heap_rebuilt", False))
                 )
                 round_profile["heap_rebuild_edge_entries_scanned"] = int(
-                    heap_commit_result.get("heap_rebuild_edge_entries_scanned", 0)
+                    fused_selection_result.get("heap_rebuild_edge_entries_scanned", 0)
                 )
                 round_profile["heap_size_after_update"] = int(
-                    heap_commit_result.get("heap_size_after_update", 0)
+                    fused_selection_result.get("heap_size_after_update", 0)
                 )
                 round_profile["heap_size_after_pop"] = int(
-                    heap_pop_result.get("heap_size_after_pop", 0)
+                    fused_selection_result.get("heap_size_after_pop", 0)
                 )
                 round_profile["heap_entries_popped"] = int(
-                    heap_pop_result.get("heap_entries_popped", 0)
+                    fused_selection_result.get("heap_entries_popped", 0)
                 )
                 round_profile["heap_stale_entries_popped"] = int(
-                    heap_pop_result.get("heap_stale_entries_popped", 0)
+                    fused_selection_result.get("heap_stale_entries_popped", 0)
                 )
                 round_profile["heap_inactive_entries_popped"] = int(
-                    heap_pop_result.get("heap_inactive_entries_popped", 0)
+                    fused_selection_result.get("heap_inactive_entries_popped", 0)
                 )
                 round_profile["heap_guard_entries_popped"] = int(
-                    heap_pop_result.get("heap_guard_entries_popped", 0)
+                    fused_selection_result.get("heap_guard_entries_popped", 0)
                 )
                 round_profile["heap_dirty_entries_popped"] = int(
-                    heap_pop_result.get("heap_dirty_entries_popped", 0)
+                    fused_selection_result.get("heap_dirty_entries_popped", 0)
+                )
+                round_profile["native_selection_transaction_runtime_sec"] = float(
+                    fused_selection_result.get("native_selection_transaction_runtime_sec", 0.0)
+                )
+                selected_edge = (
+                    int(fused_selection_result.get("selected_u", -1)),
+                    int(fused_selection_result.get("selected_v", -1)),
+                )
+                if selected_edge[0] < 0 or selected_edge[1] < 0:
+                    raise RuntimeError("Fused native selection did not return valid edge endpoints.")
+                removed_round = [selected_edge]
+                round_profile["best_selection_runtime_sec"] = float(
+                    fused_selection_result.get("native_selection_transaction_runtime_sec", 0.0)
                 )
             else:
-                if native_cached_best_edge_id >= 0:
-                    cached_best_edge_id = native_cached_best_edge_id
+                refreshed_best_edge_id = None
+                if refresh_edge_ids:
+                    (
+                        refreshed_best_edge_id,
+                        native_scalar_refresh_runtime_sec,
+                        scalar_refresh_profile,
+                    ) = _refresh_incremental_scores_from_delta_cache(
+                        refresh_edge_ids=refresh_edge_ids,
+                        current_raw=current_raw,
+                        current_std=current_std,
+                        stats=stats,
+                        score_mode=config.score_mode,
+                        eps=config.eps,
+                        candidate_delta_cache=candidate_delta_cache,
+                        delta_valid_cache=delta_valid_cache,
+                        score_cache_values=score_cache_values,
+                        degree_score_cache_values=degree_score_cache_values,
+                        support_score_cache_values=support_score_cache_values,
+                        valid_score_cache=valid_score_cache,
+                        native_graph_state=native_graph_state,
+                    )
+                    scalar_refreshed_score_count = len(refresh_edge_ids)
+                    round_profile.update(scalar_refresh_profile)
+                rescored_best_edge_id = None
+                if rescored_edge_ids:
+                    (
+                        rescored_best_edge_id,
+                        native_score_runtime_sec,
+                        incremental_score_profile,
+                    ) = _score_incremental_round_best(
+                        rescored_edge_ids=rescored_edge_ids,
+                        edge_array_by_id=edge_array_by_id,
+                        current_adjacency=current_adjacency,
+                        current_raw=current_raw,
+                        current_std=current_std,
+                        stats=stats,
+                        score_mode=config.score_mode,
+                        eps=config.eps,
+                        score_cache_values=score_cache_values,
+                        degree_score_cache_values=degree_score_cache_values,
+                        support_score_cache_values=support_score_cache_values,
+                        valid_score_cache=valid_score_cache,
+                        candidate_delta_cache=candidate_delta_cache if candidate_delta_cache_enabled else None,
+                        delta_valid_cache=delta_valid_cache if candidate_delta_cache_enabled else None,
+                        profile_native_kernel=profile_native_kernel,
+                        native_kernel_variant=native_kernel_variant,
+                        native_graph_state=native_graph_state,
+                        prebuilt_csr=prebuilt_csr,
+                        prebuilt_csr_runtime_sec=prebuilt_csr_runtime_sec,
+                    )
+                    _relshift_log(
+                        verbose,
+                        f"[relshift] round={round_idx} rescored={len(rescored_edge_ids)}/{len(rescored_edge_ids)} "
+                        f"reused={reused_score_count} native_score_sec={native_score_runtime_sec:.4f}",
+                    )
                 else:
-                    cached_best_edge_id = _best_cached_edge_id(
-                        reused_edge_ids,
+                    _relshift_log(verbose, f"[relshift] round={round_idx} rescored=0 reused={reused_score_count} native_score_sec=0.0000")
+                best_selection_start = time.perf_counter()
+                if use_versioned_heap:
+                    heap_commit_result = (
+                        native_graph_state.commit_dirty_heap_keys_fused(float(heap_rebuild_ratio))
+                        if use_native_fused_state
+                        else native_graph_state.commit_dirty_heap_keys(
+                            score_cache_values,
+                            degree_score_cache_values,
+                            support_score_cache_values,
+                            valid_score_cache,
+                            float(heap_rebuild_ratio),
+                        )
+                    )
+                    heap_pop_result = native_graph_state.pop_best_versioned_heap()
+                    selected_edge_id_raw = int(heap_pop_result.get("selected_edge_id", -1))
+                    selected_edge_id = selected_edge_id_raw if selected_edge_id_raw >= 0 else None
+                    round_profile["heap_update_runtime_sec"] = float(
+                        heap_commit_result.get("heap_update_runtime_sec", 0.0)
+                    )
+                    round_profile["heap_pop_runtime_sec"] = float(
+                        heap_pop_result.get("heap_pop_runtime_sec", 0.0)
+                    )
+                    round_profile["heap_keys_pushed"] = int(
+                        heap_commit_result.get("heap_keys_pushed", 0)
+                    )
+                    round_profile["heap_rebuilt"] = int(
+                        bool(heap_commit_result.get("heap_rebuilt", False))
+                    )
+                    round_profile["heap_rebuild_edge_entries_scanned"] = int(
+                        heap_commit_result.get("heap_rebuild_edge_entries_scanned", 0)
+                    )
+                    round_profile["heap_size_after_update"] = int(
+                        heap_commit_result.get("heap_size_after_update", 0)
+                    )
+                    round_profile["heap_size_after_pop"] = int(
+                        heap_pop_result.get("heap_size_after_pop", 0)
+                    )
+                    round_profile["heap_entries_popped"] = int(
+                        heap_pop_result.get("heap_entries_popped", 0)
+                    )
+                    round_profile["heap_stale_entries_popped"] = int(
+                        heap_pop_result.get("heap_stale_entries_popped", 0)
+                    )
+                    round_profile["heap_inactive_entries_popped"] = int(
+                        heap_pop_result.get("heap_inactive_entries_popped", 0)
+                    )
+                    round_profile["heap_guard_entries_popped"] = int(
+                        heap_pop_result.get("heap_guard_entries_popped", 0)
+                    )
+                    round_profile["heap_dirty_entries_popped"] = int(
+                        heap_pop_result.get("heap_dirty_entries_popped", 0)
+                    )
+                else:
+                    if native_cached_best_edge_id >= 0:
+                        cached_best_edge_id = native_cached_best_edge_id
+                    else:
+                        cached_best_edge_id = _best_cached_edge_id(
+                            reused_edge_ids,
+                            score_cache_values=score_cache_values,
+                            degree_score_cache_values=degree_score_cache_values,
+                            support_score_cache_values=support_score_cache_values,
+                        )
+                    selected_edge_id = _merge_best_edge_ids(
+                        cached_best_edge_id,
+                        _merge_best_edge_ids(
+                            refreshed_best_edge_id,
+                            rescored_best_edge_id,
+                            score_cache_values=score_cache_values,
+                            degree_score_cache_values=degree_score_cache_values,
+                            support_score_cache_values=support_score_cache_values,
+                        ),
                         score_cache_values=score_cache_values,
                         degree_score_cache_values=degree_score_cache_values,
                         support_score_cache_values=support_score_cache_values,
                     )
-                selected_edge_id = _merge_best_edge_ids(
-                    cached_best_edge_id,
-                    _merge_best_edge_ids(
-                        refreshed_best_edge_id,
-                        rescored_best_edge_id,
-                        score_cache_values=score_cache_values,
-                        degree_score_cache_values=degree_score_cache_values,
-                        support_score_cache_values=support_score_cache_values,
-                    ),
-                    score_cache_values=score_cache_values,
-                    degree_score_cache_values=degree_score_cache_values,
-                    support_score_cache_values=support_score_cache_values,
-                )
-            if selected_edge_id is None:
-                raise RuntimeError("Incremental RelShift could not select an edge from non-empty eligible set.")
-            selected_edge = edge_by_id[selected_edge_id]
-            removed_round = [selected_edge]
-            round_profile["best_selection_runtime_sec"] = float(time.perf_counter() - best_selection_start)
+                if selected_edge_id is None:
+                    raise RuntimeError("Incremental RelShift could not select an edge from non-empty eligible set.")
+                selected_edge = edge_by_id[selected_edge_id]
+                removed_round = [selected_edge]
+                round_profile["best_selection_runtime_sec"] = float(time.perf_counter() - best_selection_start)
         elif relshift_engine == "incremental_sequential_exact":
             if rescored_edges:
                 rescored_scores, native_score_runtime_sec, incremental_score_profile = _compute_edge_scores_incremental_round(
@@ -662,39 +901,93 @@ def relshift_prune(
         round_profile["score_selection_runtime_sec"] = round_profile["score_sort_runtime_sec"]
         if not fast_incremental_selection:
             round_profile["best_selection_runtime_sec"] = round_profile["score_selection_runtime_sec"]
-        removed_total.extend(removed_round)
+        if use_native_fused_state:
+            removed_total_count += len(removed_round)
+        else:
+            removed_total.extend(removed_round)
+            removed_total_count = len(removed_total)
         update_block_start = time.perf_counter()
         selected_delta_runtime_sec = 0.0
         apply_state_update_runtime_sec = 0.0
+        native_transaction_removed_edge = False
         if relshift_engine == "incremental_sequential_exact":
-            timer = time.perf_counter()
-            selected_edge_delta, native_invalidated_score_count, native_cache_update_profile = _compute_selected_edge_delta_incremental(
-                current_adjacency,
-                removed_round[0],
-                native_graph_state=native_graph_state,
-                prebuilt_csr=prebuilt_csr,
-                selected_edge_id=selected_edge_id,
-                valid_score_cache=valid_score_cache,
-                delta_valid_cache=delta_valid_cache,
-                candidate_delta_cache=candidate_delta_cache,
-                update_candidate_delta_cache=candidate_delta_cache_enabled,
-                invalidate_cache=bool(use_score_cache and fast_incremental_selection and selected_edge_id is not None),
-            )
-            selected_delta_runtime_sec = float(time.perf_counter() - timer)
-            timer = time.perf_counter()
-            (
-                current_raw,
-                current_std,
-                local_update_summary,
-            ) = _apply_single_edge_incremental_update(
-                current_adjacency=current_adjacency,
-                current_raw=current_raw,
-                current_std=current_std,
-                edge_delta=selected_edge_delta,
-                stats=stats,
-                profile_update_diagnostics=profile_update_diagnostics,
-            )
-            apply_state_update_runtime_sec = float(time.perf_counter() - timer)
+            if use_native_fused_state:
+                if selected_edge_id is None:
+                    raise RuntimeError("Native fused state requires selected_edge_id.")
+                timer = time.perf_counter()
+                fused_result = native_graph_state.apply_selected_edge_and_remove_fused(
+                    int(selected_edge_id),
+                    float(adjacency_compaction_threshold),
+                )
+                selected_delta_runtime_sec = float(time.perf_counter() - timer)
+                # Native state has already consumed the exact delta and updated
+                # all affected GDV rows and candidate caches.  No per-round
+                # affected-node/raw-delta arrays are materialized in Python.
+                selected_edge_delta = None
+                native_invalidated_score_count = int(fused_result.get("invalidated_count", 0))
+                native_cache_update_profile = {
+                    "mixed_correction_edge_count": int(fused_result.get("mixed_correction_edge_count", 0)),
+                    "delta_impacted_full_rescore_count": int(
+                        fused_result.get("delta_impacted_full_rescore_count", 0)
+                    ),
+                    "native_mixed_correction_runtime_sec": float(
+                        fused_result.get("native_mixed_correction_runtime_sec", 0.0)
+                    ),
+                    "native_state_transaction_runtime_sec": float(
+                        fused_result.get("native_state_transaction_runtime_sec", 0.0)
+                    ),
+                    "incremental_support_decrement_count": int(
+                        fused_result.get("support_decrement_count", 0)
+                    ),
+                    "adjacency_compaction_runtime_sec": float(
+                        fused_result.get("adjacency_compaction_runtime_sec", 0.0)
+                    ),
+                    "adjacency_compacted": int(
+                        bool(fused_result.get("adjacency_compacted", False))
+                    ),
+                    "adjacency_entries_before_compaction": int(
+                        fused_result.get("adjacency_entries_before_compaction", 0)
+                    ),
+                    "adjacency_entries_after_compaction": int(
+                        fused_result.get("adjacency_entries_after_compaction", 0)
+                    ),
+                }
+                local_update_summary = {
+                    "update_union_size": int(fused_result.get("changed_node_count", 0)),
+                    "update_union_edge_count_before": 0,
+                    "update_union_edge_count_after": 0,
+                }
+                apply_state_update_runtime_sec = 0.0
+                native_transaction_removed_edge = True
+            else:
+                timer = time.perf_counter()
+                selected_edge_delta, native_invalidated_score_count, native_cache_update_profile = _compute_selected_edge_delta_incremental(
+                    current_adjacency,
+                    removed_round[0],
+                    native_graph_state=native_graph_state,
+                    prebuilt_csr=prebuilt_csr,
+                    selected_edge_id=selected_edge_id,
+                    valid_score_cache=valid_score_cache,
+                    delta_valid_cache=delta_valid_cache,
+                    candidate_delta_cache=candidate_delta_cache,
+                    update_candidate_delta_cache=candidate_delta_cache_enabled,
+                    invalidate_cache=bool(use_score_cache and fast_incremental_selection and selected_edge_id is not None),
+                )
+                selected_delta_runtime_sec = float(time.perf_counter() - timer)
+                timer = time.perf_counter()
+                (
+                    current_raw,
+                    current_std,
+                    local_update_summary,
+                ) = _apply_single_edge_incremental_update(
+                    current_adjacency=current_adjacency,
+                    current_raw=current_raw,
+                    current_std=current_std,
+                    edge_delta=selected_edge_delta,
+                    stats=stats,
+                    profile_update_diagnostics=profile_update_diagnostics,
+                )
+                apply_state_update_runtime_sec = float(time.perf_counter() - timer)
         else:
             timer = time.perf_counter()
             (
@@ -718,7 +1011,13 @@ def relshift_prune(
         if native_cache_update_profile:
             round_profile.update({key: float(value) for key, value in native_cache_update_profile.items()})
         timer = time.perf_counter()
-        dirty_signature_nodes = list(selected_edge_delta.affected_nodes) if relshift_engine == "incremental_sequential_exact" else _batch_update_nodes(current_adjacency, removed_round)
+        dirty_signature_nodes = (
+            []
+            if use_native_fused_state
+            else list(selected_edge_delta.affected_nodes)
+            if relshift_engine == "incremental_sequential_exact"
+            else _batch_update_nodes(current_adjacency, removed_round)
+        )
         round_profile["dirty_signature_nodes_runtime_sec"] = float(time.perf_counter() - timer)
         timer = time.perf_counter()
         invalidated_score_count = 0
@@ -773,22 +1072,34 @@ def relshift_prune(
         round_profile["batch_edge_tensor_removal_runtime_sec"] = 0.0
         if is_incremental_sequential:
             timer = time.perf_counter()
-            _remove_edges_from_incremental_state(
-                current_adjacency=current_adjacency,
-                current_degrees=current_degrees,
-                removed_round=removed_round,
-            )
+            if native_transaction_removed_edge:
+                u, v = removed_round[0]
+                if current_degrees[u] <= 0 or current_degrees[v] <= 0:
+                    raise RuntimeError("Python degree mirror underflow during fused native removal.")
+                current_degrees[u] -= 1
+                current_degrees[v] -= 1
+            else:
+                _remove_edges_from_incremental_state(
+                    current_adjacency=current_adjacency,
+                    current_degrees=current_degrees,
+                    removed_round=removed_round,
+                )
             round_profile["python_incremental_state_removal_runtime_sec"] = float(time.perf_counter() - timer)
-            if native_graph_state is not None:
+            if native_graph_state is not None and not native_transaction_removed_edge:
                 timer = time.perf_counter()
                 native_graph_state.remove_edge(int(removed_round[0][0]), int(removed_round[0][1]))
                 round_profile["native_graph_edge_removal_runtime_sec"] = float(time.perf_counter() - timer)
-            removed_edge_ids = [edge_to_id[edge] for edge in removed_round]
-            for removed_edge_id in removed_edge_ids:
-                if active_edge_mask[removed_edge_id] == 0:
-                    raise RuntimeError(f"Edge id {removed_edge_id} was removed twice.")
-                active_edge_mask[removed_edge_id] = 0
-                active_edge_count -= 1
+            if native_transaction_removed_edge:
+                active_edge_count -= len(removed_round)
+                if active_edge_count < 0:
+                    raise RuntimeError("Active edge count underflow after fused native removal.")
+            else:
+                removed_edge_ids = [edge_to_id[edge] for edge in removed_round]
+                for removed_edge_id in removed_edge_ids:
+                    if active_edge_mask[removed_edge_id] == 0:
+                        raise RuntimeError(f"Edge id {removed_edge_id} was removed twice.")
+                    active_edge_mask[removed_edge_id] = 0
+                    active_edge_count -= 1
             round_profile["active_edge_list_rebuild_runtime_sec"] = 0.0
         else:
             timer = time.perf_counter()
@@ -920,13 +1231,40 @@ def relshift_prune(
         _write_score_table(score_table_path, analysis_rows)
         score_table_write_runtime_sec = float(time.perf_counter() - score_table_write_start)
     total_runtime_including_score_write_sec = float(time.perf_counter() - start)
-    final_active_edges = (
-        [edge_by_id[int(edge_id)] for edge_id in np.flatnonzero(active_edge_mask)]
-        if is_incremental_sequential
-        else active_edges
-    )
-    pruned_edge_index = _edges_tensor(final_active_edges) if is_incremental_sequential else current_edges
-
+    if use_native_fused_state:
+        final_active_array = np.asarray(
+            native_graph_state.active_edges_snapshot(), dtype=np.int64
+        ).reshape((-1, 2))
+        if final_active_array.shape[0] != active_edge_count:
+            raise RuntimeError(
+                "Python/native final active-edge counts diverged: "
+                f"python={active_edge_count}, native={final_active_array.shape[0]}."
+            )
+        pruned_edge_index = (
+            torch.from_numpy(final_active_array.copy()).t().contiguous()
+            if final_active_array.size
+            else torch.empty((2, 0), dtype=torch.long)
+        )
+    else:
+        final_active_edges = (
+            [edge_by_id[int(edge_id)] for edge_id in np.flatnonzero(active_edge_mask)]
+            if is_incremental_sequential
+            else active_edges
+        )
+        pruned_edge_index = _edges_tensor(final_active_edges) if is_incremental_sequential else current_edges
+    if use_native_fused_state:
+        removed_edge_array = np.asarray(
+            native_graph_state.removed_edges_snapshot(), dtype=np.int64
+        ).reshape((-1, 2))
+        removed_total_count = int(removed_edge_array.shape[0])
+        removed_edge_index = (
+            torch.from_numpy(removed_edge_array.copy()).t().contiguous()
+            if removed_edge_array.size
+            else torch.empty((2, 0), dtype=torch.long)
+        )
+    else:
+        removed_edge_index = _edges_tensor(removed_total)
+        removed_total_count = len(removed_total)
     peak_rss_end_mb = _peak_rss_mb() if profile_memory else None
     known_state_bytes = _known_profile_state_bytes(
         edge_array_by_id=edge_array_by_id,
@@ -947,6 +1285,11 @@ def relshift_prune(
         if use_versioned_heap and native_graph_state is not None
         else {}
     )
+    native_fused_state_stats = (
+        dict(native_graph_state.relshift_state_statistics())
+        if use_native_fused_state and native_graph_state is not None
+        else {}
+    )
     runtime_summary = _build_runtime_summary(
         bundle=bundle,
         config=config,
@@ -954,7 +1297,7 @@ def relshift_prune(
         profile_label=profile_label,
         relshift_engine=relshift_engine,
         budget=budget,
-        removed_total=removed_total,
+        achieved_budget=removed_total_count,
         runtime_sec=float(runtime),
         total_runtime_including_score_write_sec=total_runtime_including_score_write_sec,
         configuration_setup_runtime_sec=configuration_setup_runtime_sec,
@@ -979,13 +1322,22 @@ def relshift_prune(
         else 0.0
     )
     heap_bound_bytes_per_edge = (
-        heap_rebuild_ratio * heap_entry_size_bytes + heap_auxiliary_bytes_per_edge
+        (
+            float(final_heap_stats.get("heap_current_estimated_bytes", 0.0))
+            / max(bundle.num_edges, 1)
+            + heap_auxiliary_bytes_per_edge
+        )
+        if use_versioned_heap and heap_storage_mode == "indexed"
+        else heap_rebuild_ratio * heap_entry_size_bytes + heap_auxiliary_bytes_per_edge
         if use_versioned_heap
         else 0.0
     )
     runtime_summary["selection_backend"] = {
         "incremental_selection_backend": incremental_selection_backend,
-        "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap else None,
+        "native_state_fusion": use_native_fused_state,
+        "native_fused_state_statistics": native_fused_state_stats if use_native_fused_state else None,
+        "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap and heap_storage_mode == "versioned" else None,
+        "heap_storage_mode": heap_storage_mode if use_versioned_heap else None,
         "heap_auxiliary_bytes_per_edge": heap_auxiliary_bytes_per_edge if use_versioned_heap else None,
         "heap_rebuild_bound_bytes_per_edge": heap_bound_bytes_per_edge if use_versioned_heap else None,
         "heap_rebuild_bound_gib_at_1m_edges": (
@@ -1012,7 +1364,7 @@ def relshift_prune(
     return PruningResult(
         method="relshift",
         pruned_edge_index=pruned_edge_index,
-        removed_edge_index=_edges_tensor(removed_total),
+        removed_edge_index=removed_edge_index,
         before_edge_count=bundle.num_edges,
         after_edge_count=int(pruned_edge_index.shape[1]),
         runtime_sec=float(runtime),
@@ -1046,7 +1398,16 @@ def relshift_prune(
             "runtime_profile": runtime_summary if write_runtime_profile else None,
             "use_native_graph_state": use_native_graph_state,
             "incremental_selection_backend": incremental_selection_backend,
-            "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap else None,
+            "native_state_fusion": use_native_fused_state,
+            "native_fused_state_statistics": native_fused_state_stats if use_native_fused_state else None,
+            "heap_rebuild_ratio": heap_rebuild_ratio if use_versioned_heap and heap_storage_mode == "versioned" else None,
+            "heap_storage_mode": heap_storage_mode if use_versioned_heap else None,
+            "adjacency_compaction_threshold": (
+                adjacency_compaction_threshold if use_native_fused_state else None
+            ),
+            "bridge_maintenance_mode": (
+                bridge_maintenance_mode if use_versioned_heap else None
+            ),
             "versioned_heap_statistics": final_heap_stats if use_versioned_heap else None,
             "profile_native_kernel": profile_native_kernel,
             "native_omp_threads_requested": native_omp_threads,
@@ -1065,7 +1426,7 @@ def relshift_prune(
             "cache_invalidation_mode": "native_or_boolean_state_changed_incident_plus_delta_impacted" if is_incremental_sequential else "batch_original_region_and_local_neighbors",
             "native_kernel_version": _native_kernel_version(native_kernel_variant) if is_incremental_sequential else "",
             "native_selection_mode": (
-                "versioned_heap_exact" if use_versioned_heap
+                f"{heap_storage_mode}_heap_exact" if use_versioned_heap
                 else "native_best_with_array_cache" if is_incremental_sequential and not write_edge_scores
                 else "materialized_edge_scores"
             ),
@@ -1095,10 +1456,10 @@ def relshift_prune(
             "score_table_write_runtime_sec": score_table_write_runtime_sec,
             "total_runtime_including_score_write_sec": total_runtime_including_score_write_sec,
             "requested_total_budget": budget,
-            "achieved_total_budget": len(removed_total),
-            "budget_shortfall": max(0, budget - len(removed_total)),
+            "achieved_total_budget": removed_total_count,
+            "budget_shortfall": max(0, budget - removed_total_count),
             "achieved_edge_reduction": 1.0 - (float(pruned_edge_index.shape[1]) / max(bundle.num_edges, 1)),
-            "structural_guard_ceiling_hit": len(removed_total) < budget,
+            "structural_guard_ceiling_hit": removed_total_count < budget,
             "edge_level_guard_diagnostics": False,
             "round_summaries": round_summaries,
             "score_table_path": str(score_table_path) if score_table_path else None,
@@ -1351,7 +1712,17 @@ def _score_incremental_round_best(
     candidate_edges = None if native_graph_state is not None and hasattr(native_graph_state, "score_edge_ids_round_best") else edge_array_by_id[candidate_edge_ids]
     profile["score_candidate_array_runtime_sec"] = float(time.perf_counter() - timer)
     extension_start = time.perf_counter()
-    if native_graph_state is not None and hasattr(native_graph_state, "score_edge_ids_round_best"):
+    if (
+        native_graph_state is not None
+        and hasattr(native_graph_state, "relshift_state_initialized")
+        and bool(native_graph_state.relshift_state_initialized())
+    ):
+        ext_result = native_graph_state.score_edge_ids_round_best_fused(
+            candidate_edge_ids,
+            native_kernel_variant,
+            bool(profile_native_kernel),
+        )
+    elif native_graph_state is not None and hasattr(native_graph_state, "score_edge_ids_round_best"):
         ext_result = native_graph_state.score_edge_ids_round_best(
             candidate_edge_ids,
             current_raw,
@@ -1444,21 +1815,29 @@ def _refresh_incremental_scores_from_delta_cache(
     if native_graph_state is None or not hasattr(native_graph_state, "refresh_scores_from_delta_cache"):
         raise RuntimeError("candidate delta cache refresh requires NativeGraphState.refresh_scores_from_delta_cache.")
     timer = time.perf_counter()
-    result = native_graph_state.refresh_scores_from_delta_cache(
-        np.asarray(refresh_edge_ids, dtype=np.int64),
-        current_raw,
-        current_std,
-        stats.mean,
-        stats.std,
-        score_mode,
-        float(eps),
-        candidate_delta_cache,
-        delta_valid_cache,
-        score_cache_values,
-        degree_score_cache_values,
-        support_score_cache_values,
-        valid_score_cache,
-    )
+    if (
+        hasattr(native_graph_state, "relshift_state_initialized")
+        and bool(native_graph_state.relshift_state_initialized())
+    ):
+        result = native_graph_state.refresh_scores_from_delta_cache_fused(
+            np.asarray(refresh_edge_ids, dtype=np.int64),
+        )
+    else:
+        result = native_graph_state.refresh_scores_from_delta_cache(
+            np.asarray(refresh_edge_ids, dtype=np.int64),
+            current_raw,
+            current_std,
+            stats.mean,
+            stats.std,
+            score_mode,
+            float(eps),
+            candidate_delta_cache,
+            delta_valid_cache,
+            score_cache_values,
+            degree_score_cache_values,
+            support_score_cache_values,
+            valid_score_cache,
+        )
     runtime_sec = float(time.perf_counter() - timer)
     best_edge_id = int(result.get("best_edge_id", -1))
     return (
@@ -1553,6 +1932,56 @@ def _require_incremental_extension():
     from ._incremental_ext import require_incremental_extension
 
     return require_incremental_extension()
+
+
+def _edge_index_to_native_csr(
+    num_nodes: int,
+    edge_index: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build stable undirected edge ids and sorted immutable CSR without Python sets.
+
+    The row order in ``edge_array_by_id`` is the original edge order, preserving
+    the final deterministic edge-id tie-break.  Only the directed CSR entries are
+    sorted by ``(source, destination)`` for two-pointer intersections.
+    """
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, num_edges].")
+    edges = edge_index.detach().cpu().t().contiguous().numpy().astype(np.int64, copy=False)
+    if edges.size == 0:
+        return (
+            np.empty((0, 2), dtype=np.int64),
+            np.zeros(num_nodes + 1, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.zeros(num_nodes, dtype=np.int64),
+        )
+    if np.any(edges < 0) or np.any(edges >= num_nodes):
+        raise ValueError("edge_index contains a node id outside [0, num_nodes).")
+    left = np.minimum(edges[:, 0], edges[:, 1])
+    right = np.maximum(edges[:, 0], edges[:, 1])
+    if np.any(left == right):
+        raise ValueError("RelShift exact engine does not support self-loops.")
+    # Preserve the exact input orientation for public outputs and deterministic
+    # regression tests.  Internal adjacency and pair lookup remain undirected.
+    edge_array_by_id = edges.astype(np.int64, copy=False)
+    canonical_edges = np.column_stack((left, right)).astype(np.int64, copy=False)
+
+    # Stable edge ids require one row per undirected edge.  The former Python
+    # dict/set path also implicitly required uniqueness; make it explicit here.
+    order_by_edge = np.lexsort((canonical_edges[:, 1], canonical_edges[:, 0]))
+    sorted_edges = canonical_edges[order_by_edge]
+    if sorted_edges.shape[0] > 1 and np.any(np.all(sorted_edges[1:] == sorted_edges[:-1], axis=1)):
+        raise ValueError("edge_index contains duplicate undirected edges.")
+
+    sources = np.concatenate((edge_array_by_id[:, 0], edge_array_by_id[:, 1]))
+    destinations = np.concatenate((edge_array_by_id[:, 1], edge_array_by_id[:, 0]))
+    directed_order = np.lexsort((destinations, sources))
+    sorted_sources = sources[directed_order]
+    col_idx = destinations[directed_order].astype(np.int64, copy=False)
+    degrees = np.bincount(sorted_sources, minlength=num_nodes).astype(np.int64, copy=False)
+    row_ptr = np.empty(num_nodes + 1, dtype=np.int64)
+    row_ptr[0] = 0
+    np.cumsum(degrees, out=row_ptr[1:])
+    return edge_array_by_id, row_ptr, col_idx, degrees
 
 
 def _adjacency_to_csr(current_adjacency: list[set[int]]) -> tuple[np.ndarray, np.ndarray]:
@@ -2144,7 +2573,8 @@ def _build_runtime_summary(
     profile_label: str,
     relshift_engine: str,
     budget: int,
-    removed_total: list[tuple[int, int]],
+    achieved_budget: int | None = None,
+    removed_total: list[tuple[int, int]] | None = None,
     runtime_sec: float,
     total_runtime_including_score_write_sec: float,
     configuration_setup_runtime_sec: float,
@@ -2189,6 +2619,7 @@ def _build_runtime_summary(
         "heap_guard_wrapper_runtime_sec",
         "heap_update_runtime_sec",
         "heap_pop_runtime_sec",
+        "lazy_bridge_runtime_sec",
         "best_selection_runtime_sec",
         "selected_update_runtime_sec",
         "selected_delta_runtime_sec",
@@ -2224,6 +2655,12 @@ def _build_runtime_summary(
         "bridge_nodes_visited",
         "bridge_adjacency_entries_visited",
         "bridge_inactive_adjacency_entries_skipped",
+        "lazy_bridge_queries",
+        "lazy_bridge_support_certificates",
+        "lazy_bridge_nodes_visited",
+        "lazy_bridge_adjacency_entries_visited",
+        "lazy_bridge_inactive_entries_skipped",
+        "lazy_bridges_rejected",
         "rescored_edge_count",
         "scalar_refreshed_edge_count",
         "refresh_candidate_count",
@@ -2235,7 +2672,9 @@ def _build_runtime_summary(
     ]
     totals = {key: int(round(_sum_round_metric(round_summaries, key))) for key in count_keys}
     round_count = len(round_summaries)
-    achieved_budget = len(removed_total)
+    if achieved_budget is None:
+        achieved_budget = len(removed_total or [])
+    achieved_budget = int(achieved_budget)
     total_candidate_actions = (
         totals["rescored_edge_count"]
         + totals["scalar_refreshed_edge_count"]
