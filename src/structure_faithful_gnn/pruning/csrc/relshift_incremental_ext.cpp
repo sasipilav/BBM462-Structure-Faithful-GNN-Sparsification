@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,8 @@ namespace py = pybind11;
 namespace {
 
 constexpr int kOrbitDim = 15;
+constexpr int kDestroyedOrbitColumn = kOrbitDim;
+constexpr int kOrbitTransitionColumns = kOrbitDim + 1;
 constexpr const char* kOrbitRegistryVersion = "orca-node-orbits-2to4-v1";
 constexpr int kUvEdgeBit = 1;
 constexpr int kUAEdgeBit = 2;
@@ -1077,6 +1080,140 @@ void accumulate_full_delta_for_mask_dense(
     }
 }
 
+using OrbitTransitionMatrix = std::array<int64_t, kOrbitDim * kOrbitTransitionColumns>;
+
+void accumulate_orbit_transition_for_mask(
+    const int size,
+    const int before_mask,
+    OrbitTransitionMatrix& transition
+) {
+    const OrbitRow& before = orbit_row_for_mask(size, before_mask);
+    if (!is_valid_orbit_row(before)) {
+        return;
+    }
+    const OrbitRow& after = orbit_row_for_mask(size, before_mask & (~kUvEdgeBit));
+    const bool after_is_connected = is_valid_orbit_row(after);
+    for (int local_idx = 0; local_idx < size; ++local_idx) {
+        const int source_orbit = before[local_idx];
+        const int destination_orbit = after_is_connected
+            ? static_cast<int>(after[local_idx])
+            : kDestroyedOrbitColumn;
+        if (source_orbit < 0 || source_orbit >= kOrbitDim) {
+            throw std::runtime_error("invalid source orbit during transition accounting.");
+        }
+        if (destination_orbit < 0 || destination_orbit >= kOrbitTransitionColumns) {
+            throw std::runtime_error("invalid destination orbit during transition accounting.");
+        }
+        transition[
+            static_cast<size_t>(source_orbit) * static_cast<size_t>(kOrbitTransitionColumns)
+            + static_cast<size_t>(destination_orbit)
+        ] += 1;
+    }
+}
+
+void attach_orbit_event_to_result(
+    py::dict& result,
+    const OrbitTransitionMatrix& transition,
+    const double* raw_delta,
+    const size_t affected_node_count
+) {
+    if (raw_delta == nullptr && affected_node_count != 0) {
+        throw std::runtime_error("orbit-event raw delta pointer is null.");
+    }
+
+    std::array<int64_t, kOrbitDim> loss{};
+    std::array<int64_t, kOrbitDim> gain{};
+    std::array<int64_t, kOrbitDim> net{};
+    std::array<int64_t, kOrbitDim> absolute_delta{};
+    std::array<int64_t, kOrbitDim> raw_net{};
+    int64_t destroyed_incidence_count = 0;
+    int64_t unchanged_incidence_count = 0;
+    int64_t transition_incidence_count = 0;
+
+    for (int source = 0; source < kOrbitDim; ++source) {
+        for (int destination = 0; destination < kOrbitTransitionColumns; ++destination) {
+            const int64_t count = transition[
+                static_cast<size_t>(source) * static_cast<size_t>(kOrbitTransitionColumns)
+                + static_cast<size_t>(destination)
+            ];
+            if (count < 0) {
+                throw std::runtime_error("orbit transition count underflow.");
+            }
+            transition_incidence_count += count;
+            if (destination == source) {
+                unchanged_incidence_count += count;
+                continue;
+            }
+            loss[static_cast<size_t>(source)] += count;
+            if (destination < kOrbitDim) {
+                gain[static_cast<size_t>(destination)] += count;
+            } else {
+                destroyed_incidence_count += count;
+            }
+        }
+    }
+
+    for (size_t row = 0; row < affected_node_count; ++row) {
+        const size_t offset = row * static_cast<size_t>(kOrbitDim);
+        for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+            const double value = raw_delta[offset + static_cast<size_t>(orbit_idx)];
+            const int64_t rounded = static_cast<int64_t>(std::llround(value));
+            if (std::abs(value - static_cast<double>(rounded)) > 1e-9) {
+                throw std::runtime_error("orbit-event raw delta is not integer-valued.");
+            }
+            raw_net[static_cast<size_t>(orbit_idx)] += rounded;
+            absolute_delta[static_cast<size_t>(orbit_idx)] += std::abs(rounded);
+        }
+    }
+
+    for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+        net[static_cast<size_t>(orbit_idx)] =
+            gain[static_cast<size_t>(orbit_idx)] - loss[static_cast<size_t>(orbit_idx)];
+        if (net[static_cast<size_t>(orbit_idx)] != raw_net[static_cast<size_t>(orbit_idx)]) {
+            throw std::runtime_error("orbit transition matrix does not reconstruct raw orbit delta.");
+        }
+        if (absolute_delta[static_cast<size_t>(orbit_idx)] < std::abs(net[static_cast<size_t>(orbit_idx)])) {
+            throw std::runtime_error("orbit absolute delta is smaller than aggregate net delta.");
+        }
+    }
+    int64_t total_net = 0;
+    for (const int64_t value : net) {
+        total_net += value;
+    }
+    if (total_net != -destroyed_incidence_count) {
+        throw std::runtime_error("orbit transition incidence conservation failed.");
+    }
+
+    py::array_t<int64_t> transition_array(py::array::ShapeContainer{
+        static_cast<ssize_t>(kOrbitDim),
+        static_cast<ssize_t>(kOrbitTransitionColumns)
+    });
+    std::copy(transition.begin(), transition.end(), transition_array.mutable_data());
+    py::array_t<int64_t> loss_array(static_cast<ssize_t>(kOrbitDim));
+    py::array_t<int64_t> gain_array(static_cast<ssize_t>(kOrbitDim));
+    py::array_t<int64_t> net_array(static_cast<ssize_t>(kOrbitDim));
+    py::array_t<int64_t> absolute_delta_array(static_cast<ssize_t>(kOrbitDim));
+    std::copy(loss.begin(), loss.end(), loss_array.mutable_data());
+    std::copy(gain.begin(), gain.end(), gain_array.mutable_data());
+    std::copy(net.begin(), net.end(), net_array.mutable_data());
+    std::copy(absolute_delta.begin(), absolute_delta.end(), absolute_delta_array.mutable_data());
+
+    result["orbit_transition_matrix"] = std::move(transition_array);
+    result["orbit_loss"] = std::move(loss_array);
+    result["orbit_gain"] = std::move(gain_array);
+    result["orbit_net"] = std::move(net_array);
+    result["orbit_absolute_delta"] = std::move(absolute_delta_array);
+    result["destroyed_incidence_count"] = destroyed_incidence_count;
+    result["unchanged_incidence_count"] = unchanged_incidence_count;
+    result["transition_incidence_count"] = transition_incidence_count;
+    result["orbit_event_schema_version"] = "relshift-orbit-edge-events-v1";
+    result["orbit_transition_schema_version"] = "relshift-orbit-transitions-v1";
+    result["orbit_registry_version"] = kOrbitRegistryVersion;
+    result["orbit_dim"] = static_cast<int64_t>(kOrbitDim);
+    result["destroyed_orbit_column"] = static_cast<int64_t>(kDestroyedOrbitColumn);
+    result["orbit_transition_columns"] = static_cast<int64_t>(kOrbitTransitionColumns);
+}
+
 // All exact candidate scorers use this same raw-to-standardized operation
 // order.  The StdView argument remains for API compatibility and diagnostics.
 template <typename RawView, typename StdView, typename MeanView, typename StdStatsView>
@@ -1322,7 +1459,8 @@ py::dict compute_selected_edge_delta_impl(
     const int u,
     const int v,
     const int64_t* adjacency_edge_ids = nullptr,
-    const uint8_t* active_edge_mask = nullptr
+    const uint8_t* active_edge_mask = nullptr,
+    const bool collect_orbit_event = false
 ) {
     std::vector<int> marks(static_cast<size_t>(num_nodes), 0);
     std::vector<int> attachment_masks(static_cast<size_t>(num_nodes), 0);
@@ -1385,6 +1523,10 @@ py::dict compute_selected_edge_delta_impl(
         }
     }
     double* raw_delta_ptr = static_cast<double*>(raw_delta_array.mutable_data());
+    std::unique_ptr<OrbitTransitionMatrix> orbit_transition;
+    if (collect_orbit_event) {
+        orbit_transition = std::make_unique<OrbitTransitionMatrix>();
+    }
 
     std::vector<uint64_t> impacted_edge_codes;
     impacted_edge_codes.reserve(pair_masks.size() * 5U + directly_attached.size() * 2U);
@@ -1397,9 +1539,15 @@ py::dict compute_selected_edge_delta_impl(
     };
 
     accumulate_full_delta_for_mask(2, kUvEdgeBit, {u, v, -1, -1}, affected_index, raw_delta_ptr);
+    if (collect_orbit_event) {
+        accumulate_orbit_transition_for_mask(2, kUvEdgeBit, *orbit_transition);
+    }
     for (const int node : directly_attached) {
         const int mask = mask_for_three_from_attachment(attachment_masks[node]);
         accumulate_full_delta_for_mask(3, mask, {u, v, node, -1}, affected_index, raw_delta_ptr);
+        if (collect_orbit_event) {
+            accumulate_orbit_transition_for_mask(3, mask, *orbit_transition);
+        }
         if ((mask & kUAEdgeBit) != 0) {
             add_impacted_edge(u, node);
         }
@@ -1409,6 +1557,9 @@ py::dict compute_selected_edge_delta_impl(
     }
     for (const PairMask& pair : pair_masks) {
         accumulate_full_delta_for_mask(4, pair.mask, {u, v, pair.first, pair.second}, affected_index, raw_delta_ptr);
+        if (collect_orbit_event) {
+            accumulate_orbit_transition_for_mask(4, pair.mask, *orbit_transition);
+        }
         if ((pair.mask & kUAEdgeBit) != 0) {
             add_impacted_edge(u, pair.first);
         }
@@ -1444,6 +1595,11 @@ py::dict compute_selected_edge_delta_impl(
     result["impacted_edges"] = std::move(impacted_edges_array);
     result["directly_attached_size"] = static_cast<int64_t>(directly_attached.size());
     result["four_node_pair_count"] = static_cast<int64_t>(pair_masks.size());
+    if (collect_orbit_event) {
+        attach_orbit_event_to_result(
+            result, *orbit_transition, raw_delta_ptr, affected_nodes.size()
+        );
+    }
     return result;
 }
 
@@ -1451,7 +1607,8 @@ py::dict compute_selected_edge_delta(
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> row_ptr_array,
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> col_idx_array,
     const int u,
-    const int v
+    const int v,
+    const bool collect_orbit_event = false
 ) {
     const auto row_ptr = row_ptr_array.unchecked<1>();
     const auto col_idx = col_idx_array.unchecked<1>();
@@ -1460,7 +1617,10 @@ py::dict compute_selected_edge_delta(
         col_idx.data(0),
         static_cast<int>(row_ptr.shape(0) - 1),
         u,
-        v
+        v,
+        nullptr,
+        nullptr,
+        collect_orbit_event
     );
 }
 
@@ -2769,7 +2929,8 @@ public:
 
     py::dict apply_selected_edge_and_remove_fused(
         const int64_t selected_edge_id,
-        const double adjacency_compaction_threshold = 0.20
+        const double adjacency_compaction_threshold = 0.20,
+        const bool collect_orbit_event = false
     ) {
         require_relshift_state_internal();
         py::object native_state_owner = py::cast(this, py::return_value_policy::reference);
@@ -2817,11 +2978,12 @@ public:
                 valid_score_cache_array,
                 delta_valid_array,
                 candidate_delta_array,
-                false
+                false,
+                collect_orbit_event
             );
         } else {
             delta_result = compute_selected_edge_delta_and_invalidate(
-                selected_edge_id, valid_score_cache_array
+                selected_edge_id, valid_score_cache_array, collect_orbit_event
             );
             const auto affected_nodes_array = delta_result["affected_nodes"].cast<
                 py::array_t<int64_t, py::array::c_style | py::array::forcecast>
@@ -4283,7 +4445,11 @@ public:
         return result;
     }
 
-    py::dict compute_selected_edge_delta_state(const int u, const int v) const {
+    py::dict compute_selected_edge_delta_state(
+        const int u,
+        const int v,
+        const bool collect_orbit_event = false
+    ) const {
         return compute_selected_edge_delta_impl(
             row_ptr_.data(),
             col_idx_.data(),
@@ -4291,13 +4457,15 @@ public:
             u,
             v,
             adjacency_edge_ids_.data(),
-            active_edge_mask_.data()
+            active_edge_mask_.data(),
+            collect_orbit_event
         );
     }
 
     py::dict compute_selected_edge_delta_and_invalidate(
         const int64_t selected_edge_id,
-        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array,
+        const bool collect_orbit_event = false
     ) {
         if (!has_edge_ids_) {
             throw std::runtime_error("NativeGraphState native invalidation requires edge id state.");
@@ -4314,7 +4482,8 @@ public:
             u,
             v,
             adjacency_edge_ids_.data(),
-            active_edge_mask_.data()
+            active_edge_mask_.data(),
+            collect_orbit_event
         );
 
         auto valid_score_cache = valid_score_cache_array.mutable_unchecked<1>();
@@ -4395,7 +4564,8 @@ public:
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> valid_score_cache_array,
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> delta_valid_cache_array,
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> candidate_delta_cache_array,
-        const bool materialize_impacted_edges = true
+        const bool materialize_impacted_edges = true,
+        const bool collect_orbit_event = false
     ) {
         if (!has_edge_ids_) {
             throw std::runtime_error("NativeGraphState candidate-delta update requires edge id state.");
@@ -4493,6 +4663,10 @@ public:
             0.0
         );
         double* raw_delta_ptr = selected_raw_delta_workspace_.data();
+        std::unique_ptr<OrbitTransitionMatrix> orbit_transition;
+        if (collect_orbit_event) {
+            orbit_transition = std::make_unique<OrbitTransitionMatrix>();
+        }
 
         int64_t invalidated_count = 0;
         int64_t corrected_edge_count = 0;
@@ -4651,6 +4825,9 @@ public:
             2, kUvEdgeBit, {u, v, -1, -1},
             node_workspace_epoch_, node_epoch, node_workspace_index_, raw_delta_ptr
         );
+        if (collect_orbit_event) {
+            accumulate_orbit_transition_for_mask(2, kUvEdgeBit, *orbit_transition);
+        }
         for (const int node : directly_attached) {
             const int mask = mask_for_three_from_attachment(attachment_masks[node]);
             const std::array<int, 4> nodes{u, v, node, -1};
@@ -4658,6 +4835,9 @@ public:
                 3, mask, nodes,
                 node_workspace_epoch_, node_epoch, node_workspace_index_, raw_delta_ptr
             );
+            if (collect_orbit_event) {
+                accumulate_orbit_transition_for_mask(3, mask, *orbit_transition);
+            }
             process_graphlet_edges(3, mask, nodes);
         }
         for (const PairMask& pair : pair_masks) {
@@ -4666,6 +4846,9 @@ public:
                 4, pair.mask, nodes,
                 node_workspace_epoch_, node_epoch, node_workspace_index_, raw_delta_ptr
             );
+            if (collect_orbit_event) {
+                accumulate_orbit_transition_for_mask(4, pair.mask, *orbit_transition);
+            }
             process_graphlet_edges(4, pair.mask, nodes);
         }
 
@@ -4792,6 +4975,11 @@ public:
         result["mixed_correction_edge_count"] = corrected_edge_count;
         result["delta_impacted_full_rescore_count"] = full_rescore_edge_count;
         result["native_mixed_correction_runtime_sec"] = std::chrono::duration<double>(Clock::now() - update_start).count();
+        if (collect_orbit_event) {
+            attach_orbit_event_to_result(
+                result, *orbit_transition, selected_raw_delta_workspace_.data(), affected_nodes.size()
+            );
+        }
         return result;
     }
 
@@ -5523,7 +5711,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("refresh_scores_from_delta_cache_fused", &NativeGraphState::refresh_scores_from_delta_cache_fused, py::arg("candidate_edge_ids"))
         .def("commit_dirty_heap_keys_fused", &NativeGraphState::commit_dirty_heap_keys_fused, py::arg("rebuild_ratio") = 4.0)
         .def("select_best_edge_fused", &NativeGraphState::select_best_edge_fused, py::arg("d_min"), py::arg("guard_bridges"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("rebuild_ratio") = 4.0, py::arg("bridge_maintenance_mode") = "global_tarjan", py::arg("heap_storage_mode") = "versioned")
-        .def("apply_selected_edge_and_remove_fused", &NativeGraphState::apply_selected_edge_and_remove_fused, py::arg("selected_edge_id"), py::arg("adjacency_compaction_threshold") = 0.20)
+        .def("apply_selected_edge_and_remove_fused", &NativeGraphState::apply_selected_edge_and_remove_fused, py::arg("selected_edge_id"), py::arg("adjacency_compaction_threshold") = 0.20, py::arg("collect_orbit_event") = false)
         .def("candidate_delta_cache_snapshot", &NativeGraphState::candidate_delta_cache_snapshot)
         .def("delta_valid_cache_snapshot", &NativeGraphState::delta_valid_cache_snapshot)
         .def("score_cache_snapshot", &NativeGraphState::score_cache_snapshot)
@@ -5546,9 +5734,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("score_edges_round_best", &NativeGraphState::score_edges_round_best_state, py::arg("candidate_edges"), py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
         .def("score_edge_ids_round_best", &NativeGraphState::score_edge_ids_round_best, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
         .def("refresh_scores_from_delta_cache", &NativeGraphState::refresh_scores_from_delta_cache, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("candidate_delta_cache"), py::arg("delta_valid_cache"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"))
-        .def("compute_selected_edge_delta", &NativeGraphState::compute_selected_edge_delta_state, py::arg("u"), py::arg("v"))
-        .def("compute_selected_edge_delta_and_invalidate", &NativeGraphState::compute_selected_edge_delta_and_invalidate, py::arg("selected_edge_id"), py::arg("valid_score_cache"))
-        .def("compute_selected_edge_delta_and_update_candidate_cache", &NativeGraphState::compute_selected_edge_delta_and_update_candidate_cache, py::arg("selected_edge_id"), py::arg("valid_score_cache"), py::arg("delta_valid_cache"), py::arg("candidate_delta_cache"), py::arg("materialize_impacted_edges") = true)
+        .def("compute_selected_edge_delta", &NativeGraphState::compute_selected_edge_delta_state, py::arg("u"), py::arg("v"), py::arg("collect_orbit_event") = false)
+        .def("compute_selected_edge_delta_and_invalidate", &NativeGraphState::compute_selected_edge_delta_and_invalidate, py::arg("selected_edge_id"), py::arg("valid_score_cache"), py::arg("collect_orbit_event") = false)
+        .def("compute_selected_edge_delta_and_update_candidate_cache", &NativeGraphState::compute_selected_edge_delta_and_update_candidate_cache, py::arg("selected_edge_id"), py::arg("valid_score_cache"), py::arg("delta_valid_cache"), py::arg("candidate_delta_cache"), py::arg("materialize_impacted_edges") = true, py::arg("collect_orbit_event") = false)
         .def("remove_edge", &NativeGraphState::remove_edge, py::arg("u"), py::arg("v"))
         .def("directed_edge_count", &NativeGraphState::directed_edge_count)
         .def("immutable_directed_adjacency_entry_count", &NativeGraphState::immutable_directed_adjacency_entry_count)
@@ -5558,7 +5746,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
 
     module.def("score_edges_round", &score_edges_round, py::arg("row_ptr"), py::arg("col_idx"), py::arg("candidate_edges"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("include_update_sizes") = true);
     module.def("score_edges_round_best", &score_edges_round_best, py::arg("row_ptr"), py::arg("col_idx"), py::arg("candidate_edges"), py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none());
-    module.def("compute_selected_edge_delta", &compute_selected_edge_delta, py::arg("row_ptr"), py::arg("col_idx"), py::arg("u"), py::arg("v"));
+    module.def("compute_selected_edge_delta", &compute_selected_edge_delta, py::arg("row_ptr"), py::arg("col_idx"), py::arg("u"), py::arg("v"), py::arg("collect_orbit_event") = false);
     module.def("eligible_edge_ids_from_csr", &eligible_edge_ids_from_csr, py::arg("row_ptr"), py::arg("col_idx"), py::arg("active_edge_ids"), py::arg("edge_array_by_id"), py::arg("degrees"), py::arg("d_min"), py::arg("guard_bridges"));
     module.def("eligible_edge_id_partitions_from_csr", &eligible_edge_id_partitions_from_csr, py::arg("row_ptr"), py::arg("col_idx"), py::arg("active_edge_ids"), py::arg("edge_array_by_id"), py::arg("degrees"), py::arg("d_min"), py::arg("guard_bridges"), py::arg("valid_score_cache"), py::arg("use_score_cache"));
     module.def("canonical_tables", &canonical_tables);

@@ -14,6 +14,10 @@ import numpy as np
 import torch
 
 from ..config import PruningConfig
+from ..analysis.orbit_explainability import (
+    OrbitEdgeEvent,
+    write_orbit_explainability_artifacts,
+)
 from ..gdv.backends import GDVService, apply_standardization, fit_standardization
 from .incremental_relshift import IncrementalEdgeDelta
 from ..types import DatasetBundle, PruningResult
@@ -64,6 +68,13 @@ def relshift_prune(
     score_norm = "l1"
     use_score_cache = bool((config.options or {}).get("use_score_cache", True))
     write_edge_scores = bool((config.options or {}).get("write_edge_scores", False))
+    orbit_explainability_enabled = bool(
+        (config.options or {}).get("orbit_explainability_enabled", False)
+    )
+    if orbit_explainability_enabled and artifact_dir is None:
+        raise ValueError(
+            "orbit_explainability_enabled=true requires artifact_dir so exact event artifacts are not silently discarded."
+        )
     verbose = bool((config.options or {}).get("verbose", False))
     profile_rounds = bool((config.options or {}).get("profile_rounds", False))
     profile_update_diagnostics = bool((config.options or {}).get("profile_update_diagnostics", False))
@@ -163,6 +174,7 @@ def relshift_prune(
     removed_total_count = 0
     round_summaries: list[dict[str, object]] = []
     analysis_rows: list[dict[str, object]] = []
+    orbit_edge_events: list[OrbitEdgeEvent] = []
     score_cache: dict[tuple[int, int], EdgeScore] = {}
     invalidated_score_edges: set[tuple[int, int]] = set()
     fast_incremental_default = is_incremental_sequential and not write_edge_scores
@@ -170,6 +182,16 @@ def relshift_prune(
         fast_incremental_default and incremental_selection_backend == "versioned_heap"
     )
     use_native_fused_state = bool(use_versioned_heap and native_state_fusion_requested)
+    if orbit_explainability_enabled and not use_native_fused_state:
+        raise ValueError(
+            "Orbit explainability logging requires the fused exact native engine "
+            "(versioned_heap selection with native_state_fusion=true)."
+        )
+    if orbit_explainability_enabled and write_edge_scores:
+        raise ValueError(
+            "Orbit explainability logging is incompatible with write_edge_scores; "
+            "use the selected-edge native event path instead."
+        )
     if heap_storage_mode == "indexed" and not use_native_fused_state:
         raise ValueError("heap_storage_mode=indexed requires native_state_fusion=true and versioned_heap selection.")
     native_graph_state = None
@@ -926,6 +948,7 @@ def relshift_prune(
                 fused_result = native_graph_state.apply_selected_edge_and_remove_fused(
                     int(selected_edge_id),
                     float(adjacency_compaction_threshold),
+                    bool(orbit_explainability_enabled),
                 )
                 selected_delta_runtime_sec = float(time.perf_counter() - timer)
                 # Native state has already consumed the exact delta and updated
@@ -1127,6 +1150,25 @@ def relshift_prune(
             round_profile["inactive_directed_adjacency_entries_after"] = int(
                 storage_stats_after.get("inactive_directed_adjacency_entries", 0)
             )
+        if orbit_explainability_enabled:
+            if not use_native_fused_state or selected_edge_id is None:
+                raise RuntimeError("Orbit explainability event requires a fused selected edge.")
+            if fused_selection_result is None:
+                raise RuntimeError("Orbit explainability event is missing fused selection metadata.")
+            orbit_edge_events.append(
+                OrbitEdgeEvent.from_native_result(
+                    round_index=round_idx,
+                    selected_edge_id=selected_edge_id,
+                    u=removed_round[0][0],
+                    v=removed_round[0][1],
+                    relshift_score=float(fused_selection_result.get("best_score", float("nan"))),
+                    degree_score=float(fused_selection_result.get("best_degree_score", float("nan"))),
+                    support_score=float(fused_selection_result.get("best_support_score", float("nan"))),
+                    active_edges_before=current_edge_count,
+                    active_edges_after=active_edge_count,
+                    native_result=fused_result,
+                )
+            )
         round_profile["valid_score_cache_count_after"] = int(valid_score_cache.sum()) if is_incremental_sequential else int(len(score_cache))
         round_profile["delta_valid_cache_count_after"] = int(delta_valid_cache.sum()) if is_incremental_sequential else 0
         if profile_memory:
@@ -1239,6 +1281,20 @@ def relshift_prune(
         _write_score_table(score_table_path, analysis_rows)
         score_table_write_runtime_sec = float(time.perf_counter() - score_table_write_start)
     total_runtime_including_score_write_sec = float(time.perf_counter() - start)
+    orbit_explainability_artifacts: dict[str, object] | None = None
+    orbit_explainability_write_runtime_sec = 0.0
+    if orbit_explainability_enabled:
+        orbit_write_start = time.perf_counter()
+        orbit_explainability_artifacts = write_orbit_explainability_artifacts(
+            artifact_dir,
+            events=orbit_edge_events,
+            dataset=bundle.name,
+            pruning_seed=seed,
+            score_mode=config.score_mode,
+            target_rho=float(config.rho),
+        )
+        orbit_explainability_write_runtime_sec = float(time.perf_counter() - orbit_write_start)
+    total_runtime_including_artifact_writes_sec = float(time.perf_counter() - start)
     if use_native_fused_state:
         final_active_array = np.asarray(
             native_graph_state.active_edges_snapshot(), dtype=np.int64
@@ -1395,6 +1451,11 @@ def relshift_prune(
             "round_state_update_mode": "single_edge_exact_incremental" if relshift_engine == "incremental_sequential_exact" else "union_two_hop_exact_local_recount",
             "score_reuse_mode": "cache_with_local_invalidation" if use_score_cache else "full_rescore_per_round",
             "write_edge_scores": write_edge_scores,
+            "orbit_explainability_enabled": orbit_explainability_enabled,
+            "orbit_explainability_event_count": len(orbit_edge_events),
+            "orbit_explainability_artifacts": orbit_explainability_artifacts,
+            "orbit_explainability_write_runtime_sec": orbit_explainability_write_runtime_sec,
+            "total_runtime_including_artifact_writes_sec": total_runtime_including_artifact_writes_sec,
             "verbose": verbose,
             "profile_rounds": profile_rounds,
             "profile_update_diagnostics": profile_update_diagnostics,
