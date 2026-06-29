@@ -26,6 +26,10 @@ MASTER_RESULTS_COLUMNS = [
     "largest_component_ratio",
     "num_components",
     "clustering_delta",
+    "degree_distribution_tv",
+    "degree_distribution_js",
+    "homophily_delta",
+    "isolated_node_ratio_delta",
     "mean_delta_sig",
     "median_delta_sig",
     "mean_delta_rel",
@@ -56,6 +60,12 @@ def canonical_run_row(run_dir: str | Path) -> dict[str, Any]:
     metrics = artifacts["metrics"]
     resolved = artifacts["resolved_config"]
     pruning_result = artifacts["pruning_result"] or {}
+    metrics_metadata = metrics.get("metadata", {}) if isinstance(metrics.get("metadata"), dict) else {}
+    structural_controls = (
+        metrics_metadata.get("structural_controls", {})
+        if isinstance(metrics_metadata.get("structural_controls", {}), dict)
+        else {}
+    )
 
     dataset = resolved.get("dataset", {}).get("name")
     model = resolved.get("model", {}).get("name")
@@ -97,6 +107,10 @@ def canonical_run_row(run_dir: str | Path) -> dict[str, Any]:
         "largest_component_ratio": _required_float(metrics, "largest_component_ratio", run_dir),
         "num_components": _required_int(metrics, "num_components", run_dir),
         "clustering_delta": _required_float(metrics, "clustering_delta", run_dir),
+        "degree_distribution_tv": _maybe_float(structural_controls.get("degree_distribution_tv")),
+        "degree_distribution_js": _maybe_float(structural_controls.get("degree_distribution_js")),
+        "homophily_delta": _maybe_float(structural_controls.get("homophily_delta")),
+        "isolated_node_ratio_delta": _maybe_float(structural_controls.get("isolated_node_ratio_delta")),
         "mean_delta_sig": _maybe_float(metrics.get("mean_delta_sig")),
         "median_delta_sig": _maybe_float(metrics.get("median_delta_sig")),
         "mean_delta_rel": _maybe_float(metrics.get("mean_delta_rel")),

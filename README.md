@@ -396,3 +396,28 @@ Ready-to-run configuration and documentation:
 - `docs/phase2_step3_checkpoint_orbit_distortion.md`
 - `docs/phase2_step3_validation.json`
 - `docs/phase2_orbit_registry.json`
+
+## Phase 2 orbit sensitivity workflow
+
+Enable exact orbit logging in the RelShift pruning config, generate prune-only artifacts, and train the selected graphs with multiple model/training seeds. Then build the paired sensitivity table:
+
+```bash
+python scripts/build_orbit_sensitivity_dataset.py \
+  --training-root results/frontier_training \
+  --dense-root results/frontier_dense \
+  --output-dir results/phase2_orbit_sensitivity/dataset
+```
+
+Run leakage-safe controlled regressions:
+
+```bash
+python scripts/run_orbit_sensitivity_regression.py \
+  --dataset results/phase2_orbit_sensitivity/dataset/orbit_sensitivity_dataset.csv \
+  --output-dir results/phase2_orbit_sensitivity/regression \
+  --target accuracy_loss \
+  --orbit-feature-family standardized_absolute \
+  --split-modes dataset model reduction_band pruning_seed \
+  --estimators ridge elastic_net
+```
+
+The split implementation blocks on structural `pruning_artifact_id`, so the same sparsified graph cannot appear in both training and test through another GNN model or training seed. See `docs/phase2_step4_gnn_sensitivity_controlled_regression.md` for the complete data and validation contract.

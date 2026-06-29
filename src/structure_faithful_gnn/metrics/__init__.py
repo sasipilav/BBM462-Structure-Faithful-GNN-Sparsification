@@ -1,3 +1,3 @@
-from .structural import compute_structural_metrics
+from .structural import compute_structural_controls, compute_structural_metrics
 
-__all__ = ["compute_structural_metrics"]
+__all__ = ["compute_structural_controls", "compute_structural_metrics"]

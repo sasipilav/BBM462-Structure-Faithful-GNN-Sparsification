@@ -15,6 +15,23 @@ from .orbit_explainability import (
     write_orbit_explainability_artifacts,
 )
 
+from .orbit_sensitivity import (
+    CONTROL_COLUMNS,
+    FIXED_EFFECT_COLUMNS,
+    IDENTITY_COLUMNS,
+    ORBIT_FEATURE_FAMILIES,
+    ORBIT_SENSITIVITY_DATASET_SCHEMA_VERSION,
+    ORBIT_SENSITIVITY_REGRESSION_SCHEMA_VERSION,
+    TARGET_COLUMNS,
+    OrbitSensitivityDatasetResult,
+    OuterSplit,
+    RegressionRunResult,
+    build_leakage_safe_outer_splits,
+    build_orbit_sensitivity_dataset,
+    load_orbit_sensitivity_dataset,
+    run_controlled_orbit_regression,
+)
+
 from .artifacts import (
     MASTER_RESULTS_COLUMNS,
     canonical_run_row,
@@ -28,6 +45,20 @@ from .artifacts import (
 )
 
 __all__ = [
+    "CONTROL_COLUMNS",
+    "FIXED_EFFECT_COLUMNS",
+    "IDENTITY_COLUMNS",
+    "ORBIT_FEATURE_FAMILIES",
+    "ORBIT_SENSITIVITY_DATASET_SCHEMA_VERSION",
+    "ORBIT_SENSITIVITY_REGRESSION_SCHEMA_VERSION",
+    "TARGET_COLUMNS",
+    "OrbitSensitivityDatasetResult",
+    "OuterSplit",
+    "RegressionRunResult",
+    "build_leakage_safe_outer_splits",
+    "build_orbit_sensitivity_dataset",
+    "load_orbit_sensitivity_dataset",
+    "run_controlled_orbit_regression",
     "MASTER_RESULTS_COLUMNS",
     "canonical_run_row",
     "load_dense_rows",

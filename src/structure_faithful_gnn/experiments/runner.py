@@ -8,11 +8,10 @@ from ..artifacts import load_pruned_graph_artifact, write_run_artifacts
 from ..config import DatasetConfig, ModelConfig, PruningConfig, resolved_config_dict
 from ..data.loaders import load_dataset
 from ..gdv.backends import GDVService
-from ..metrics.structural import compute_structural_metrics
+from ..metrics.structural import compute_structural_controls, compute_structural_metrics
 from ..models.trainer import TrainingResult, train_and_evaluate
 from ..pruning.registry import prune_graph
 from ..types import PrunedGraphArtifact, PruningResult, RunMetrics
-from ..utils.graph import clustering_coefficient, connected_component_summary
 from ..utils.io import ensure_dir
 
 
@@ -35,7 +34,7 @@ def run_dense_experiment(
 ) -> ExperimentOutcome:
     bundle = load_dataset(dataset_config)
     training = train_and_evaluate(bundle, model_config, seed)
-    num_components, largest_component_ratio = connected_component_summary(bundle.num_nodes, bundle.edge_index)
+    structural_controls = compute_structural_controls(bundle, bundle)
     metrics = RunMetrics(
         accuracy=training.accuracy,
         macro_f1=training.macro_f1,
@@ -46,10 +45,13 @@ def run_dense_experiment(
         median_delta_sig=0.0,
         mean_delta_rel=0.0,
         median_delta_rel=0.0,
-        largest_component_ratio=largest_component_ratio,
-        num_components=num_components,
+        largest_component_ratio=float(structural_controls["largest_component_ratio"]),
+        num_components=int(structural_controls["num_components"]),
         clustering_delta=0.0,
-        metadata={"training": training.to_dict()},
+        metadata={
+            "training": training.to_dict(),
+            "structural_controls": structural_controls,
+        },
     )
     resolved = resolved_config_dict(dataset_config, model_config, seed=seed)
     run_dir = _run_dir(output_root, bundle.name, model_config.name, "dense", seed, run_name)
@@ -94,6 +96,7 @@ def run_pruning_experiment(
     )
     training = train_and_evaluate(pruned_bundle, model_config, seed)
     structural = compute_structural_metrics(bundle, pruned_bundle, gdv_service, eps=pruning_config.eps)
+    structural_controls = compute_structural_controls(bundle, pruned_bundle)
     metrics = RunMetrics(
         accuracy=training.accuracy,
         macro_f1=training.macro_f1,
@@ -111,6 +114,7 @@ def run_pruning_experiment(
             "training": training.to_dict(),
             "pruning": pruning_result.metadata,
             "gdv_backend": gdv_service.backend_name,
+            "structural_controls": structural_controls,
         },
     )
     resolved = resolved_config_dict(dataset_config, model_config, pruning_config, seed=seed)
@@ -157,11 +161,7 @@ def run_training_on_pruned_artifact(
         },
     )
     training = train_and_evaluate(pruned_bundle, model_config, seed)
-    num_components, largest_component_ratio = connected_component_summary(bundle.num_nodes, pruned_artifact.pruned_edge_index)
-    clustering_delta = clustering_coefficient(bundle.num_nodes, pruned_artifact.pruned_edge_index) - clustering_coefficient(
-        bundle.num_nodes,
-        bundle.edge_index,
-    )
+    structural_controls = compute_structural_controls(bundle, pruned_bundle)
     metrics = RunMetrics(
         accuracy=training.accuracy,
         macro_f1=training.macro_f1,
@@ -172,13 +172,14 @@ def run_training_on_pruned_artifact(
         median_delta_sig=None,
         mean_delta_rel=None,
         median_delta_rel=None,
-        largest_component_ratio=largest_component_ratio,
-        num_components=num_components,
-        clustering_delta=clustering_delta,
+        largest_component_ratio=float(structural_controls["largest_component_ratio"]),
+        num_components=int(structural_controls["num_components"]),
+        clustering_delta=float(structural_controls["clustering_delta"]),
         metadata={
             "training": training.to_dict(),
             "pruning_seed": pruned_artifact.pruning_seed,
             "pruned_graph_artifact_dir": str(Path(artifact_dir).resolve()),
+            "structural_controls": structural_controls,
         },
     )
     resolved = resolved_config_dict(dataset_config, model_config, seed=seed)

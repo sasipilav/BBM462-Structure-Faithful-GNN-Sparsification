@@ -143,6 +143,56 @@ def clustering_coefficient(num_nodes: int, edge_index: torch.Tensor) -> float:
     return float(nx.average_clustering(graph))
 
 
+def edge_homophily(labels: torch.Tensor, edge_index: torch.Tensor) -> float:
+    """Return the fraction of undirected edges joining equal labels.
+
+    The project stores one canonical undirected edge per column. The statistic is
+    defined as zero for an edgeless graph so downstream JSON artifacts remain
+    finite and explicitly auditable.
+    """
+
+    labels = labels.long().view(-1).cpu()
+    edge_index = canonicalize_undirected_edge_index(edge_index, num_nodes=int(labels.numel()))
+    if edge_index.shape[1] == 0:
+        return 0.0
+    same = labels[edge_index[0]] == labels[edge_index[1]]
+    return float(same.float().mean().item())
+
+
+def degree_distribution_distances(
+    num_nodes: int,
+    reference_edge_index: torch.Tensor,
+    candidate_edge_index: torch.Tensor,
+) -> tuple[float, float]:
+    """Return total-variation and Jensen--Shannon degree-distribution shifts.
+
+    Histograms use the common support ``0..max_degree`` and include isolated
+    nodes. The Jensen--Shannon value uses natural logarithms and is therefore
+    bounded by ``log(2)``.
+    """
+
+    if num_nodes < 0:
+        raise ValueError("num_nodes must be non-negative")
+    reference = degree_array(num_nodes, reference_edge_index)
+    candidate = degree_array(num_nodes, candidate_edge_index)
+    if num_nodes == 0:
+        return 0.0, 0.0
+    max_degree = int(max(reference.max(initial=0), candidate.max(initial=0)))
+    reference_hist = np.bincount(reference, minlength=max_degree + 1).astype(np.float64)
+    candidate_hist = np.bincount(candidate, minlength=max_degree + 1).astype(np.float64)
+    reference_prob = reference_hist / float(num_nodes)
+    candidate_prob = candidate_hist / float(num_nodes)
+    total_variation = 0.5 * float(np.abs(reference_prob - candidate_prob).sum())
+    midpoint = 0.5 * (reference_prob + candidate_prob)
+
+    def _kl(prob: np.ndarray, base: np.ndarray) -> float:
+        mask = prob > 0.0
+        return float(np.sum(prob[mask] * np.log(prob[mask] / base[mask])))
+
+    jensen_shannon = 0.5 * _kl(reference_prob, midpoint) + 0.5 * _kl(candidate_prob, midpoint)
+    return total_variation, jensen_shannon
+
+
 def induced_subgraph_edges(nodes: list[int], adjacency: list[set[int]]) -> torch.Tensor:
     node_set = set(nodes)
     index_map = {node: idx for idx, node in enumerate(nodes)}
