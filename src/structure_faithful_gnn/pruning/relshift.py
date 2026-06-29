@@ -6,7 +6,7 @@ import os
 import platform
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,10 +15,15 @@ import torch
 
 from ..config import PruningConfig
 from ..analysis.orbit_explainability import (
+    ORBIT_TRANSITION_COLUMNS,
+    OrbitCheckpoint,
+    OrbitCheckpointTarget,
     OrbitEdgeEvent,
+    resolve_orbit_checkpoint_targets,
     write_orbit_explainability_artifacts,
 )
 from ..gdv.backends import GDVService, apply_standardization, fit_standardization
+from ..gdv.orbits import ORBIT_DIM
 from .incremental_relshift import IncrementalEdgeDelta
 from ..types import DatasetBundle, PruningResult
 from ..utils.graph import (
@@ -71,6 +76,26 @@ def relshift_prune(
     orbit_explainability_enabled = bool(
         (config.options or {}).get("orbit_explainability_enabled", False)
     )
+    orbit_checkpoint_rhos_option = (config.options or {}).get("orbit_checkpoint_rhos")
+    if orbit_checkpoint_rhos_option is not None and not isinstance(
+        orbit_checkpoint_rhos_option, (list, tuple)
+    ):
+        raise ValueError("orbit_checkpoint_rhos must be a YAML/Python list of fractions in [0, 1].")
+    orbit_checkpoint_store_node_snapshots = bool(
+        (config.options or {}).get("orbit_checkpoint_store_node_snapshots", False)
+    )
+    orbit_checkpoint_targets = (
+        resolve_orbit_checkpoint_targets(
+            original_edge_count=bundle.num_edges,
+            target_rho=float(config.rho),
+            requested_rhos=orbit_checkpoint_rhos_option,
+        )
+        if orbit_explainability_enabled
+        else ()
+    )
+    orbit_checkpoint_target_by_count = {
+        target.removed_edge_count: target for target in orbit_checkpoint_targets
+    }
     if orbit_explainability_enabled and artifact_dir is None:
         raise ValueError(
             "orbit_explainability_enabled=true requires artifact_dir so exact event artifacts are not silently discarded."
@@ -175,6 +200,14 @@ def relshift_prune(
     round_summaries: list[dict[str, object]] = []
     analysis_rows: list[dict[str, object]] = []
     orbit_edge_events: list[OrbitEdgeEvent] = []
+    orbit_checkpoints: list[OrbitCheckpoint] = []
+    orbit_checkpoint_index_by_removed_count: dict[int, int] = {}
+    orbit_cumulative_event_net = np.zeros(ORBIT_DIM, dtype=np.int64)
+    orbit_cumulative_event_absolute_delta = np.zeros(ORBIT_DIM, dtype=np.int64)
+    orbit_cumulative_transition = np.zeros((ORBIT_DIM, ORBIT_TRANSITION_COLUMNS), dtype=np.int64)
+    orbit_initial_raw_snapshot: np.ndarray | None = None
+    orbit_initial_std_snapshot: np.ndarray | None = None
+    orbit_checkpoint_capture_runtime_sec = 0.0
     score_cache: dict[tuple[int, int], EdgeScore] = {}
     invalidated_score_edges: set[tuple[int, int]] = set()
     fast_incremental_default = is_incremental_sequential and not write_edge_scores
@@ -279,6 +312,25 @@ def relshift_prune(
             float(config.eps),
             bool(candidate_delta_cache_enabled),
         )
+        if orbit_explainability_enabled:
+            orbit_initial_raw_snapshot = np.asarray(
+                native_graph_state.current_raw_snapshot(), dtype=np.float64
+            )
+            orbit_initial_std_snapshot = np.asarray(
+                native_graph_state.current_std_snapshot(), dtype=np.float64
+            )
+            if orbit_initial_raw_snapshot.shape != original_raw.shape or not np.array_equal(
+                orbit_initial_raw_snapshot, original_raw
+            ):
+                raise RuntimeError(
+                    "Native initial raw GDV snapshot does not match the exact initial GDV state."
+                )
+            if orbit_initial_std_snapshot.shape != current_std.shape or not np.allclose(
+                orbit_initial_std_snapshot, current_std, rtol=1e-12, atol=1e-12
+            ):
+                raise RuntimeError(
+                    "Native initial standardized GDV snapshot does not match fixed-stat standardization."
+                )
         # NativeGraphState is now the sole owner of the evolving numerical and
         # adjacency state.  Empty compatibility arrays make accidental use in a
         # fused branch fail loudly instead of silently maintaining a duplicate.
@@ -288,6 +340,40 @@ def relshift_prune(
         edge_array_by_id = np.empty((0, 2), dtype=np.int64)
         del original_raw
     invalidation_epoch = 1
+    if orbit_explainability_enabled:
+        if (
+            native_graph_state is None
+            or orbit_initial_raw_snapshot is None
+            or orbit_initial_std_snapshot is None
+        ):
+            raise RuntimeError(
+                "Orbit checkpoint initialization requires fused native GDV snapshots."
+            )
+        initial_target = orbit_checkpoint_target_by_count.get(0)
+        if initial_target is None:
+            raise RuntimeError("Orbit checkpoint target resolution omitted the required initial state.")
+        timer = time.perf_counter()
+        initial_checkpoint = OrbitCheckpoint.from_snapshots(
+            checkpoint_index=0,
+            round_index=0,
+            target=initial_target,
+            removed_edge_count=0,
+            active_edge_count=active_edge_count,
+            original_edge_count=bundle.num_edges,
+            event_count=0,
+            is_final=(budget == 0),
+            initial_raw=orbit_initial_raw_snapshot,
+            current_raw=orbit_initial_raw_snapshot,
+            initial_standardized=orbit_initial_std_snapshot,
+            current_standardized=orbit_initial_std_snapshot,
+            cumulative_event_net=orbit_cumulative_event_net,
+            cumulative_event_absolute_delta=orbit_cumulative_event_absolute_delta,
+            cumulative_transition=orbit_cumulative_transition,
+            store_node_snapshots=orbit_checkpoint_store_node_snapshots,
+        )
+        orbit_checkpoints.append(initial_checkpoint)
+        orbit_checkpoint_index_by_removed_count[0] = 0
+        orbit_checkpoint_capture_runtime_sec += float(time.perf_counter() - timer)
     pruning_state_initialization_runtime_sec = float(time.perf_counter() - state_initialization_start)
 
     for round_idx, round_budget in enumerate(round_budgets, start=1):
@@ -1155,20 +1241,51 @@ def relshift_prune(
                 raise RuntimeError("Orbit explainability event requires a fused selected edge.")
             if fused_selection_result is None:
                 raise RuntimeError("Orbit explainability event is missing fused selection metadata.")
-            orbit_edge_events.append(
-                OrbitEdgeEvent.from_native_result(
-                    round_index=round_idx,
-                    selected_edge_id=selected_edge_id,
-                    u=removed_round[0][0],
-                    v=removed_round[0][1],
-                    relshift_score=float(fused_selection_result.get("best_score", float("nan"))),
-                    degree_score=float(fused_selection_result.get("best_degree_score", float("nan"))),
-                    support_score=float(fused_selection_result.get("best_support_score", float("nan"))),
-                    active_edges_before=current_edge_count,
-                    active_edges_after=active_edge_count,
-                    native_result=fused_result,
-                )
+            orbit_event = OrbitEdgeEvent.from_native_result(
+                round_index=round_idx,
+                selected_edge_id=selected_edge_id,
+                u=removed_round[0][0],
+                v=removed_round[0][1],
+                relshift_score=float(fused_selection_result.get("best_score", float("nan"))),
+                degree_score=float(fused_selection_result.get("best_degree_score", float("nan"))),
+                support_score=float(fused_selection_result.get("best_support_score", float("nan"))),
+                active_edges_before=current_edge_count,
+                active_edges_after=active_edge_count,
+                native_result=fused_result,
             )
+            orbit_edge_events.append(orbit_event)
+            orbit_cumulative_event_net += orbit_event.net
+            orbit_cumulative_event_absolute_delta += orbit_event.absolute_delta
+            orbit_cumulative_transition += orbit_event.transition
+
+            checkpoint_target = orbit_checkpoint_target_by_count.get(removed_total_count)
+            if checkpoint_target is not None:
+                timer = time.perf_counter()
+                checkpoint = OrbitCheckpoint.from_snapshots(
+                    checkpoint_index=len(orbit_checkpoints),
+                    round_index=round_idx,
+                    target=checkpoint_target,
+                    removed_edge_count=removed_total_count,
+                    active_edge_count=active_edge_count,
+                    original_edge_count=bundle.num_edges,
+                    event_count=len(orbit_edge_events),
+                    is_final=False,
+                    initial_raw=orbit_initial_raw_snapshot,
+                    current_raw=np.asarray(
+                        native_graph_state.current_raw_snapshot(), dtype=np.float64
+                    ),
+                    initial_standardized=orbit_initial_std_snapshot,
+                    current_standardized=np.asarray(
+                        native_graph_state.current_std_snapshot(), dtype=np.float64
+                    ),
+                    cumulative_event_net=orbit_cumulative_event_net,
+                    cumulative_event_absolute_delta=orbit_cumulative_event_absolute_delta,
+                    cumulative_transition=orbit_cumulative_transition,
+                    store_node_snapshots=orbit_checkpoint_store_node_snapshots,
+                )
+                orbit_checkpoint_index_by_removed_count[removed_total_count] = len(orbit_checkpoints)
+                orbit_checkpoints.append(checkpoint)
+                orbit_checkpoint_capture_runtime_sec += float(time.perf_counter() - timer)
         round_profile["valid_score_cache_count_after"] = int(valid_score_cache.sum()) if is_incremental_sequential else int(len(score_cache))
         round_profile["delta_valid_cache_count_after"] = int(delta_valid_cache.sum()) if is_incremental_sequential else 0
         if profile_memory:
@@ -1272,6 +1389,66 @@ def relshift_prune(
             f"remaining_edges={active_edge_count if is_incremental_sequential else int(current_edges.shape[1])}",
         )
 
+    if orbit_explainability_enabled:
+        if (
+            native_graph_state is None
+            or orbit_initial_raw_snapshot is None
+            or orbit_initial_std_snapshot is None
+        ):
+            raise RuntimeError("Final orbit checkpoint requires fused native GDV snapshots.")
+        if len(orbit_edge_events) != removed_total_count:
+            raise RuntimeError(
+                "Orbit event count diverged from the exact removed-edge count: "
+                f"events={len(orbit_edge_events)}, removed={removed_total_count}."
+            )
+        existing_checkpoint_index = orbit_checkpoint_index_by_removed_count.get(removed_total_count)
+        if existing_checkpoint_index is not None:
+            orbit_checkpoints[existing_checkpoint_index] = replace(
+                orbit_checkpoints[existing_checkpoint_index], is_final=True
+            )
+            orbit_checkpoints[existing_checkpoint_index].validate()
+        else:
+            timer = time.perf_counter()
+            achieved_rho = (
+                float(removed_total_count) / float(bundle.num_edges) if bundle.num_edges else 0.0
+            )
+            achieved_target = OrbitCheckpointTarget(
+                removed_edge_count=removed_total_count,
+                requested_rhos=(achieved_rho,),
+                is_final_target=True,
+            )
+            final_checkpoint = OrbitCheckpoint.from_snapshots(
+                checkpoint_index=len(orbit_checkpoints),
+                round_index=len(orbit_edge_events),
+                target=achieved_target,
+                removed_edge_count=removed_total_count,
+                active_edge_count=active_edge_count,
+                original_edge_count=bundle.num_edges,
+                event_count=len(orbit_edge_events),
+                is_final=True,
+                initial_raw=orbit_initial_raw_snapshot,
+                current_raw=np.asarray(
+                    native_graph_state.current_raw_snapshot(), dtype=np.float64
+                ),
+                initial_standardized=orbit_initial_std_snapshot,
+                current_standardized=np.asarray(
+                    native_graph_state.current_std_snapshot(), dtype=np.float64
+                ),
+                cumulative_event_net=orbit_cumulative_event_net,
+                cumulative_event_absolute_delta=orbit_cumulative_event_absolute_delta,
+                cumulative_transition=orbit_cumulative_transition,
+                store_node_snapshots=orbit_checkpoint_store_node_snapshots,
+            )
+            orbit_checkpoint_index_by_removed_count[removed_total_count] = len(orbit_checkpoints)
+            orbit_checkpoints.append(final_checkpoint)
+            orbit_checkpoint_capture_runtime_sec += float(time.perf_counter() - timer)
+        if [checkpoint.removed_edge_count for checkpoint in orbit_checkpoints] != sorted(
+            checkpoint.removed_edge_count for checkpoint in orbit_checkpoints
+        ):
+            raise RuntimeError("Orbit checkpoint edge counts are not monotonically increasing.")
+        if sum(int(checkpoint.is_final) for checkpoint in orbit_checkpoints) != 1:
+            raise RuntimeError("Exactly one orbit checkpoint must be marked as final.")
+
     runtime = time.perf_counter() - start
     score_table_path = None
     score_table_write_runtime_sec = 0.0
@@ -1288,6 +1465,7 @@ def relshift_prune(
         orbit_explainability_artifacts = write_orbit_explainability_artifacts(
             artifact_dir,
             events=orbit_edge_events,
+            checkpoints=orbit_checkpoints,
             dataset=bundle.name,
             pruning_seed=seed,
             score_mode=config.score_mode,
@@ -1453,6 +1631,15 @@ def relshift_prune(
             "write_edge_scores": write_edge_scores,
             "orbit_explainability_enabled": orbit_explainability_enabled,
             "orbit_explainability_event_count": len(orbit_edge_events),
+            "orbit_checkpoint_count": len(orbit_checkpoints),
+            "orbit_checkpoint_removed_edge_counts": [
+                checkpoint.removed_edge_count for checkpoint in orbit_checkpoints
+            ],
+            "orbit_checkpoint_actual_rhos": [
+                checkpoint.actual_rho for checkpoint in orbit_checkpoints
+            ],
+            "orbit_checkpoint_store_node_snapshots": orbit_checkpoint_store_node_snapshots,
+            "orbit_checkpoint_capture_runtime_sec": orbit_checkpoint_capture_runtime_sec,
             "orbit_explainability_artifacts": orbit_explainability_artifacts,
             "orbit_explainability_write_runtime_sec": orbit_explainability_write_runtime_sec,
             "total_runtime_including_artifact_writes_sec": total_runtime_including_artifact_writes_sec,

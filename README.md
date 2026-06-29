@@ -363,7 +363,7 @@ A floating-point tie regression discovered by the wide matrix was fixed by routi
 
 Raw matrices are stored under `results/phase1_exact_engine/`.
 
-## Phase 2 steps 1 and 2: canonical orbit semantics and exact edge events
+## Phase 2 steps 1--3: canonical orbits, exact edge events, and checkpoints
 
 Phase 2 begins with a versioned canonical registry for the 15 ORCA-compatible
 node orbits used by RelShift. Python graphlet classification and the native C++
@@ -379,12 +379,20 @@ orbit_explainability_enabled: true
 
 The event path reuses the selected-edge graphlet enumeration and records a
 `15 x 16` source-to-destination orbit transition matrix, where column 15 is the
-destroyed/disconnected sink. Logging is opt-in, requires an artifact directory,
-and does not use the all-candidate `write_edge_scores` path.
+destroyed/disconnected sink. The same opt-in path now captures deterministic
+full-graph GDV checkpoints at requested edge-reduction fractions. Every
+checkpoint's raw signed displacement must exactly equal both the cumulative
+selected-edge event net and the net reconstructed from the cumulative
+transition matrix. Full node-by-orbit snapshots remain optional.
+
+Logging is opt-in, requires an artifact directory, and does not use the
+all-candidate `write_edge_scores` path.
 
 Ready-to-run configuration and documentation:
 
 - `configs/pruning/relshift_incremental_exact_orbit_explainability.yaml`
 - `docs/phase2_step1_canonical_orbit_registry.md`
 - `docs/phase2_step2_exact_orbit_event_logging.md`
+- `docs/phase2_step3_checkpoint_orbit_distortion.md`
+- `docs/phase2_step3_validation.json`
 - `docs/phase2_orbit_registry.json`

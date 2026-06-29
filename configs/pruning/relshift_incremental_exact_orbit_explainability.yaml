@@ -19,8 +19,14 @@ heap_rebuild_ratio: 4.0
 bridge_maintenance_mode: lazy_exact
 adjacency_compaction_threshold: 0.20
 
-# Phase 2 selected-edge event logging. Requires artifact_dir at runtime.
+# Phase 2 selected-edge events and full-graph orbit checkpoints.
+# Requires artifact_dir at runtime. Initial and final achieved states are always
+# included; fractions above rho are ignored and duplicate integer edge counts
+# are coalesced.
 orbit_explainability_enabled: true
+orbit_checkpoint_rhos: [0.0, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30]
+# Full [checkpoint, node, orbit] snapshots are optional because they can be large.
+orbit_checkpoint_store_node_snapshots: false
 
 profile_rounds: false
 write_runtime_profile: false
