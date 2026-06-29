@@ -5,9 +5,8 @@ from itertools import combinations
 
 import numpy as np
 
+from ..gdv.orbits import ORBIT_DIM, OrbitId
 from ..utils.graph import k_hop_nodes
-
-ORBIT_DIM = 15
 
 
 @dataclass
@@ -158,13 +157,16 @@ def _orbit_indices_from_signature(*, size: int, edge_count: int, degrees: list[i
     if size == 2:
         if edge_count != 1:
             raise ValueError(f"Invalid connected 2-node graphlet with {edge_count} edges.")
-        return (0, 0)
+        return (int(OrbitId.EDGE_ENDPOINT), int(OrbitId.EDGE_ENDPOINT))
 
     if size == 3:
         if edge_count == 2 and ordered_degrees == [1, 1, 2]:
-            return tuple(2 if degree == 2 else 1 for degree in degrees)
+            return tuple(
+                int(OrbitId.PATH3_CENTER) if degree == 2 else int(OrbitId.PATH3_ENDPOINT)
+                for degree in degrees
+            )
         if edge_count == 3 and ordered_degrees == [2, 2, 2]:
-            return (3, 3, 3)
+            return (int(OrbitId.TRIANGLE_NODE),) * 3
         raise ValueError(f"Invalid connected 3-node graphlet signature: edges={edge_count}, degrees={ordered_degrees}")
 
     if size != 4:
@@ -172,19 +174,35 @@ def _orbit_indices_from_signature(*, size: int, edge_count: int, degrees: list[i
 
     if edge_count == 3:
         if ordered_degrees == [1, 1, 1, 3]:
-            return tuple(7 if degree == 3 else 6 for degree in degrees)
+            return tuple(
+                int(OrbitId.STAR4_CENTER) if degree == 3 else int(OrbitId.STAR4_LEAF)
+                for degree in degrees
+            )
         if ordered_degrees == [1, 1, 2, 2]:
-            return tuple(5 if degree == 2 else 4 for degree in degrees)
+            return tuple(
+                int(OrbitId.PATH4_INTERNAL) if degree == 2 else int(OrbitId.PATH4_ENDPOINT)
+                for degree in degrees
+            )
     elif edge_count == 4:
         if ordered_degrees == [2, 2, 2, 2]:
-            return (8, 8, 8, 8)
+            return (int(OrbitId.CYCLE4_NODE),) * 4
         if ordered_degrees == [1, 2, 2, 3]:
             # ORCA paw/tailed-triangle order: tail leaf=9, triangle degree-2=10, attachment degree-3=11.
-            return tuple(9 if degree == 1 else 11 if degree == 3 else 10 for degree in degrees)
+            return tuple(
+                int(OrbitId.TAILED_TRIANGLE_TAIL)
+                if degree == 1
+                else int(OrbitId.TAILED_TRIANGLE_ATTACHMENT)
+                if degree == 3
+                else int(OrbitId.TAILED_TRIANGLE_TRIANGLE_NODE)
+                for degree in degrees
+            )
     elif edge_count == 5 and ordered_degrees == [2, 2, 3, 3]:
-        return tuple(12 if degree == 2 else 13 for degree in degrees)
+        return tuple(
+            int(OrbitId.DIAMOND_DEGREE2) if degree == 2 else int(OrbitId.DIAMOND_DEGREE3)
+            for degree in degrees
+        )
     elif edge_count == 6 and ordered_degrees == [3, 3, 3, 3]:
-        return (14, 14, 14, 14)
+        return (int(OrbitId.CLIQUE4_NODE),) * 4
 
     raise ValueError(f"Invalid connected 4-node graphlet signature: edges={edge_count}, degrees={ordered_degrees}")
 

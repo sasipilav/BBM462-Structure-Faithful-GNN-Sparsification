@@ -26,6 +26,7 @@ namespace py = pybind11;
 namespace {
 
 constexpr int kOrbitDim = 15;
+constexpr const char* kOrbitRegistryVersion = "orca-node-orbits-2to4-v1";
 constexpr int kUvEdgeBit = 1;
 constexpr int kUAEdgeBit = 2;
 constexpr int kUBEdgeBit = 4;
@@ -5461,6 +5462,8 @@ py::dict canonical_tables() {
     };
 
     py::dict result;
+    result["registry_version"] = kOrbitRegistryVersion;
+    result["orbit_dim"] = static_cast<int64_t>(kOrbitDim);
     result["size2"] = as_numpy(kSize2Tables, 2);
     result["size3"] = as_numpy(kSize3Tables, 8);
     result["size4"] = as_numpy(kSize4Tables, 64);

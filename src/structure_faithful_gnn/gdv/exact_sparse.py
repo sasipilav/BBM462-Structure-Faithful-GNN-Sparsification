@@ -6,7 +6,8 @@ from time import perf_counter
 
 import numpy as np
 
-from ..pruning.incremental_relshift import ORBIT_DIM, classify_connected_orbits
+from .orbits import ORBIT_DIM
+from ..pruning.incremental_relshift import classify_connected_orbits
 
 
 @dataclass(frozen=True)
