@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -770,6 +771,7 @@ ScoreResult score_from_internal_endpoint_delta(
     const std::vector<double>& stats_mean,
     const std::vector<double>& stats_std,
     const std::vector<double>& node_denominator,
+    const std::vector<double>& orbit_weights,
     const std::string& score_mode,
     const int64_t* endpoint_delta
 ) {
@@ -802,7 +804,7 @@ ScoreResult score_from_internal_endpoint_delta(
                 stats_mean[static_cast<size_t>(orbit_idx)],
                 stats_std[static_cast<size_t>(orbit_idx)]
             );
-            endpoint_l1 += std::abs(base_std - candidate_std);
+            endpoint_l1 += orbit_weights[static_cast<size_t>(orbit_idx)] * std::abs(base_std - candidate_std);
         }
         const double endpoint_denom = node_denominator[static_cast<size_t>(node)];
         absolute_sum += endpoint_l1;
@@ -834,6 +836,7 @@ double endpoint_score_from_internal_delta_masked(
     const std::vector<double>& stats_mean,
     const std::vector<double>& stats_std,
     const std::vector<double>& node_denominator,
+    const std::vector<double>& orbit_weights,
     const std::string& score_mode,
     const int64_t* endpoint_delta,
     const uint16_t nonzero_mask
@@ -860,7 +863,7 @@ double endpoint_score_from_internal_delta_masked(
             stats_mean[static_cast<size_t>(orbit_idx)],
             stats_std[static_cast<size_t>(orbit_idx)]
         );
-        endpoint_l1 += std::abs(base_std - candidate_std);
+        endpoint_l1 += orbit_weights[static_cast<size_t>(orbit_idx)] * std::abs(base_std - candidate_std);
     }
     return score_mode == "absolute"
         ? endpoint_l1
@@ -875,6 +878,7 @@ ScoreResult score_from_internal_endpoint_delta_masked(
     const std::vector<double>& stats_mean,
     const std::vector<double>& stats_std,
     const std::vector<double>& node_denominator,
+    const std::vector<double>& orbit_weights,
     const std::string& score_mode,
     const int64_t* endpoint_delta,
     const uint16_t* endpoint_nonzero_masks
@@ -907,7 +911,7 @@ ScoreResult score_from_internal_endpoint_delta_masked(
                 stats_mean[static_cast<size_t>(orbit_idx)],
                 stats_std[static_cast<size_t>(orbit_idx)]
             );
-            endpoint_l1 += std::abs(base_std - candidate_std);
+            endpoint_l1 += orbit_weights[static_cast<size_t>(orbit_idx)] * std::abs(base_std - candidate_std);
         }
         const double endpoint_denom = node_denominator[static_cast<size_t>(node)];
         absolute_sum += endpoint_l1;
@@ -1239,7 +1243,8 @@ ScoreResult score_single_edge_mask_count(
     double* score_scalarization_sec = nullptr,
     int64_t* endpoint_delta_out = nullptr,
     const int64_t* adjacency_edge_ids = nullptr,
-    const uint8_t* active_edge_mask = nullptr
+    const uint8_t* active_edge_mask = nullptr,
+    const double* orbit_weights = nullptr
 ) {
     const auto pair_start = pair_generation_sec == nullptr ? std::chrono::steady_clock::time_point{} : std::chrono::steady_clock::now();
     collect_attached_nodes(
@@ -1323,8 +1328,9 @@ ScoreResult score_single_edge_mask_count(
             const double candidate_std = canonical_standardized_coordinate(
                 candidate_raw, stats_mean(orbit_idx), stats_std(orbit_idx)
             );
-            endpoint_l1 += std::abs(base_std - candidate_std);
-            base_l1 += std::abs(base_std);
+            const double orbit_weight = orbit_weights == nullptr ? 1.0 : orbit_weights[orbit_idx];
+            endpoint_l1 += orbit_weight * std::abs(base_std - candidate_std);
+            base_l1 += orbit_weight * std::abs(base_std);
         }
         const double endpoint_denom = base_l1 + eps;
         absolute_sum += endpoint_l1;
@@ -2227,7 +2233,8 @@ public:
         py::array_t<double, py::array::c_style | py::array::forcecast> stats_std_array,
         const std::string& score_mode,
         const double eps,
-        const bool enable_candidate_delta_cache = true
+        const bool enable_candidate_delta_cache = true,
+        py::object orbit_weights_object = py::none()
     ) {
         if (!has_edge_ids_) {
             throw std::runtime_error("Native RelShift state requires stable edge ids.");
@@ -2246,6 +2253,29 @@ public:
         }
         if (!(eps > 0.0)) {
             throw std::runtime_error("eps must be positive.");
+        }
+
+        orbit_weights_state_.assign(kOrbitDim, 1.0);
+        if (!orbit_weights_object.is_none()) {
+            auto orbit_weights_array = py::array_t<double, py::array::c_style | py::array::forcecast>(
+                orbit_weights_object
+            );
+            const auto orbit_weights = orbit_weights_array.unchecked<1>();
+            if (orbit_weights.shape(0) != kOrbitDim) {
+                throw std::runtime_error("orbit_weights must have exactly 15 entries.");
+            }
+            double weight_sum = 0.0;
+            for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+                const double value = orbit_weights(orbit_idx);
+                if (!std::isfinite(value) || value < 0.0) {
+                    throw std::runtime_error("orbit_weights entries must be finite and non-negative.");
+                }
+                orbit_weights_state_[static_cast<size_t>(orbit_idx)] = value;
+                weight_sum += value;
+            }
+            if (!(weight_sum > 0.0)) {
+                throw std::runtime_error("At least one orbit weight must be positive.");
+            }
         }
 
         native_score_mode_ = score_mode;
@@ -2276,7 +2306,7 @@ public:
                 );
                 current_raw_state_[offset] = raw_value;
                 current_std_state_[offset] = standardized;
-                denominator += std::abs(standardized);
+                denominator += orbit_weights_state_[static_cast<size_t>(orbit_idx)] * std::abs(standardized);
             }
             node_denominator_state_[static_cast<size_t>(node)] = denominator;
         }
@@ -2430,6 +2460,12 @@ public:
             candidate_delta_object = candidate_delta_array;
             delta_valid_object = delta_valid_array;
         }
+        py::array_t<double> orbit_weights_array(
+            {static_cast<ssize_t>(kOrbitDim)},
+            {static_cast<ssize_t>(sizeof(double))},
+            orbit_weights_state_.data(),
+            native_state_owner
+        );
         py::dict result = score_edge_ids_round_best(
             candidate_edge_ids_array,
             current_raw_array,
@@ -2445,7 +2481,8 @@ public:
             kernel_variant,
             profile_native_kernel,
             candidate_delta_object,
-            delta_valid_object
+            delta_valid_object,
+            orbit_weights_array
         );
         const auto candidate_edge_ids = candidate_edge_ids_array.unchecked<1>();
         for (ssize_t idx = 0; idx < candidate_edge_ids.shape(0); ++idx) {
@@ -2464,14 +2501,14 @@ public:
                     endpoint_score_cache_state_[endpoint_offset] =
                         endpoint_score_from_internal_delta_masked(
                             edge[0], 0, current_raw_state_, current_std_state_,
-                            stats_mean_state_, stats_std_state_, node_denominator_state_,
+                            stats_mean_state_, stats_std_state_, node_denominator_state_, orbit_weights_state_,
                             native_score_mode_, delta,
                             candidate_delta_nonzero_mask_state_[endpoint_offset]
                         );
                     endpoint_score_cache_state_[endpoint_offset + 1] =
                         endpoint_score_from_internal_delta_masked(
                             edge[1], 1, current_raw_state_, current_std_state_,
-                            stats_mean_state_, stats_std_state_, node_denominator_state_,
+                            stats_mean_state_, stats_std_state_, node_denominator_state_, orbit_weights_state_,
                             native_score_mode_, delta,
                             candidate_delta_nonzero_mask_state_[endpoint_offset + 1]
                         );
@@ -2526,7 +2563,7 @@ public:
                 endpoint_score_cache_state_[endpoint_offset] =
                     endpoint_score_from_internal_delta_masked(
                         edge[0], 0, current_raw_state_, current_std_state_,
-                        stats_mean_state_, stats_std_state_, node_denominator_state_,
+                        stats_mean_state_, stats_std_state_, node_denominator_state_, orbit_weights_state_,
                         native_score_mode_, delta, masks[0]
                     );
                 endpoint_valid_mask = static_cast<uint8_t>(endpoint_valid_mask | 1);
@@ -2538,7 +2575,7 @@ public:
                 endpoint_score_cache_state_[endpoint_offset + 1] =
                     endpoint_score_from_internal_delta_masked(
                         edge[1], 1, current_raw_state_, current_std_state_,
-                        stats_mean_state_, stats_std_state_, node_denominator_state_,
+                        stats_mean_state_, stats_std_state_, node_denominator_state_, orbit_weights_state_,
                         native_score_mode_, delta, masks[1]
                     );
                 endpoint_valid_mask = static_cast<uint8_t>(endpoint_valid_mask | 2);
@@ -3046,7 +3083,7 @@ public:
                 );
                 current_raw_state_[offset] = updated_raw;
                 current_std_state_[offset] = updated_std;
-                denominator += std::abs(updated_std);
+                denominator += orbit_weights_state_[static_cast<size_t>(orbit_idx)] * std::abs(updated_std);
             }
             node_denominator_state_[static_cast<size_t>(node)] = denominator;
         }
@@ -3285,6 +3322,14 @@ public:
         result["raw_state_bytes"] = static_cast<int64_t>(current_raw_state_.size() * sizeof(double));
         result["std_state_bytes"] = static_cast<int64_t>(current_std_state_.size() * sizeof(double));
         result["node_denominator_bytes"] = static_cast<int64_t>(node_denominator_state_.size() * sizeof(double));
+        result["orbit_weight_bytes"] = static_cast<int64_t>(orbit_weights_state_.size() * sizeof(double));
+        result["orbit_weight_sum"] = std::accumulate(
+            orbit_weights_state_.begin(), orbit_weights_state_.end(), 0.0
+        );
+        result["orbit_weight_nonzero_count"] = static_cast<int64_t>(std::count_if(
+            orbit_weights_state_.begin(), orbit_weights_state_.end(),
+            [](const double value) { return value > 0.0; }
+        ));
         result["graphlet_workspace_bytes"] = static_cast<int64_t>(
             graphlet_marks_workspace_.size() * sizeof(int)
             + graphlet_attachment_workspace_.size() * sizeof(int)
@@ -3310,6 +3355,7 @@ public:
             current_raw_state_.size() * sizeof(double)
             + current_std_state_.size() * sizeof(double)
             + node_denominator_state_.size() * sizeof(double)
+            + orbit_weights_state_.size() * sizeof(double)
             + graphlet_marks_workspace_.size() * sizeof(int)
             + graphlet_attachment_workspace_.size() * sizeof(int)
             + node_workspace_epoch_.size() * sizeof(uint32_t)
@@ -4086,7 +4132,8 @@ public:
         const std::string& kernel_variant,
         const bool profile_native_kernel,
         py::object candidate_delta_cache_object = py::none(),
-        py::object delta_valid_cache_object = py::none()
+        py::object delta_valid_cache_object = py::none(),
+        py::object orbit_weights_object = py::none()
     ) const {
         (void)candidate_edges_array;
         return score_edge_ids_round_best(
@@ -4104,7 +4151,8 @@ public:
             kernel_variant,
             profile_native_kernel,
             candidate_delta_cache_object,
-            delta_valid_cache_object
+            delta_valid_cache_object,
+            orbit_weights_object
         );
     }
 
@@ -4123,7 +4171,8 @@ public:
         const std::string& kernel_variant,
         const bool profile_native_kernel,
         py::object candidate_delta_cache_object = py::none(),
-        py::object delta_valid_cache_object = py::none()
+        py::object delta_valid_cache_object = py::none(),
+        py::object orbit_weights_object = py::none()
     ) const {
         if (!has_edge_ids_) {
             throw std::runtime_error("NativeGraphState score_edge_ids_round_best requires edge id state.");
@@ -4142,6 +4191,29 @@ public:
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> delta_valid_cache_array;
         int64_t* candidate_delta_cache_ptr = nullptr;
         uint8_t* delta_valid_cache_ptr = nullptr;
+        py::array_t<double, py::array::c_style | py::array::forcecast> orbit_weights_array;
+        const double* orbit_weights_ptr = nullptr;
+        if (!orbit_weights_object.is_none()) {
+            orbit_weights_array = orbit_weights_object.cast<
+                py::array_t<double, py::array::c_style | py::array::forcecast>
+            >();
+            if (orbit_weights_array.ndim() != 1 || orbit_weights_array.shape(0) != kOrbitDim) {
+                throw std::runtime_error("orbit_weights must have shape [15].");
+            }
+            double weight_sum = 0.0;
+            const auto weights = orbit_weights_array.unchecked<1>();
+            for (int orbit_idx = 0; orbit_idx < kOrbitDim; ++orbit_idx) {
+                const double value = weights(orbit_idx);
+                if (!std::isfinite(value) || value < 0.0) {
+                    throw std::runtime_error("orbit_weights entries must be finite and non-negative.");
+                }
+                weight_sum += value;
+            }
+            if (!(weight_sum > 0.0)) {
+                throw std::runtime_error("At least one orbit weight must be positive.");
+            }
+            orbit_weights_ptr = static_cast<const double*>(orbit_weights_array.data());
+        }
 
         if (current_raw.shape(1) != kOrbitDim || current_std.shape(1) != kOrbitDim) {
             throw std::runtime_error("current_raw/current_std must have 15 columns.");
@@ -4215,7 +4287,8 @@ public:
                 local_score_scalarization_sec,
                 endpoint_delta_cache.data(),
                 adjacency_edge_ids_.data(),
-                active_edge_mask_.data()
+                active_edge_mask_.data(),
+                orbit_weights_ptr
             );
             const double degree_score =
                 static_cast<double>(
@@ -5582,6 +5655,7 @@ private:
     std::vector<double> stats_mean_state_;
     std::vector<double> stats_std_state_;
     std::vector<double> node_denominator_state_;
+    std::vector<double> orbit_weights_state_;
     std::vector<double> score_cache_state_;
     std::vector<double> endpoint_score_cache_state_;
     std::vector<uint8_t> endpoint_score_valid_mask_state_;
@@ -5704,7 +5778,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
             py::array_t<int64_t, py::array::c_style | py::array::forcecast>,
             py::array_t<int64_t, py::array::c_style | py::array::forcecast>
         >())
-        .def("initialize_relshift_state", &NativeGraphState::initialize_relshift_state, py::arg("current_raw"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("enable_candidate_delta_cache") = true)
+        .def("initialize_relshift_state", &NativeGraphState::initialize_relshift_state, py::arg("current_raw"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("enable_candidate_delta_cache") = true, py::arg("orbit_weights") = py::none())
         .def("relshift_state_initialized", &NativeGraphState::relshift_state_initialized)
         .def("prepare_versioned_heap_round_fused", &NativeGraphState::prepare_versioned_heap_round_fused, py::arg("d_min"), py::arg("guard_bridges"), py::arg("bridge_maintenance_mode") = "global_tarjan")
         .def("score_edge_ids_round_best_fused", &NativeGraphState::score_edge_ids_round_best_fused, py::arg("candidate_edge_ids"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false)
@@ -5731,8 +5805,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("pop_best_versioned_heap", &NativeGraphState::pop_best_versioned_heap, py::arg("bridge_maintenance_mode") = "global_tarjan")
         .def("validate_heap_invariants", &NativeGraphState::validate_heap_invariants)
         .def("versioned_heap_statistics", &NativeGraphState::versioned_heap_statistics)
-        .def("score_edges_round_best", &NativeGraphState::score_edges_round_best_state, py::arg("candidate_edges"), py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
-        .def("score_edge_ids_round_best", &NativeGraphState::score_edge_ids_round_best, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none())
+        .def("score_edges_round_best", &NativeGraphState::score_edges_round_best_state, py::arg("candidate_edges"), py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none(), py::arg("orbit_weights") = py::none())
+        .def("score_edge_ids_round_best", &NativeGraphState::score_edge_ids_round_best, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"), py::arg("kernel_variant") = "mask_count_v4_combinatorial", py::arg("profile_native_kernel") = false, py::arg("candidate_delta_cache") = py::none(), py::arg("delta_valid_cache") = py::none(), py::arg("orbit_weights") = py::none())
         .def("refresh_scores_from_delta_cache", &NativeGraphState::refresh_scores_from_delta_cache, py::arg("candidate_edge_ids"), py::arg("current_raw"), py::arg("current_std"), py::arg("stats_mean"), py::arg("stats_std"), py::arg("score_mode"), py::arg("eps"), py::arg("candidate_delta_cache"), py::arg("delta_valid_cache"), py::arg("score_cache"), py::arg("degree_score_cache"), py::arg("support_score_cache"), py::arg("valid_score_cache"))
         .def("compute_selected_edge_delta", &NativeGraphState::compute_selected_edge_delta_state, py::arg("u"), py::arg("v"), py::arg("collect_orbit_event") = false)
         .def("compute_selected_edge_delta_and_invalidate", &NativeGraphState::compute_selected_edge_delta_and_invalidate, py::arg("selected_edge_id"), py::arg("valid_score_cache"), py::arg("collect_orbit_event") = false)

@@ -25,6 +25,7 @@ from ..analysis.orbit_explainability import (
 from ..gdv.backends import GDVService, apply_standardization, fit_standardization
 from ..gdv.orbits import ORBIT_DIM
 from .incremental_relshift import IncrementalEdgeDelta
+from .orbit_weights import resolve_orbit_weight_spec, write_orbit_weight_spec
 from ..types import DatasetBundle, PruningResult
 from ..utils.graph import (
     adjacency_sets,
@@ -70,7 +71,10 @@ def relshift_prune(
     budget = int(round(bundle.num_edges * config.rho))
     current_edges = bundle.edge_index.clone()
     requested_relshift_engine = str((config.options or {}).get("relshift_engine", "auto")).strip().lower() or "auto"
-    score_norm = "l1"
+    orbit_weight_spec = resolve_orbit_weight_spec(config.options)
+    orbit_weights = np.asarray(orbit_weight_spec.weights, dtype=np.float64)
+    orbit_weighting_enabled = not orbit_weight_spec.is_uniform
+    score_norm = "weighted_l1" if orbit_weighting_enabled else "l1"
     use_score_cache = bool((config.options or {}).get("use_score_cache", True))
     write_edge_scores = bool((config.options or {}).get("write_edge_scores", False))
     orbit_explainability_enabled = bool(
@@ -215,6 +219,13 @@ def relshift_prune(
         fast_incremental_default and incremental_selection_backend == "versioned_heap"
     )
     use_native_fused_state = bool(use_versioned_heap and native_state_fusion_requested)
+    if orbit_weighting_enabled and not use_native_fused_state:
+        raise ValueError(
+            "Non-uniform orbit weights require the optimized exact fused engine "
+            "(incremental_sequential_exact, versioned_heap, native_state_fusion=true)."
+        )
+    if orbit_weighting_enabled and write_edge_scores:
+        raise ValueError("Non-uniform orbit weights are incompatible with write_edge_scores=true.")
     if orbit_explainability_enabled and not use_native_fused_state:
         raise ValueError(
             "Orbit explainability logging requires the fused exact native engine "
@@ -311,6 +322,7 @@ def relshift_prune(
             config.score_mode,
             float(config.eps),
             bool(candidate_delta_cache_enabled),
+            orbit_weights,
         )
         if orbit_explainability_enabled:
             orbit_initial_raw_snapshot = np.asarray(
@@ -1472,6 +1484,14 @@ def relshift_prune(
             target_rho=float(config.rho),
         )
         orbit_explainability_write_runtime_sec = float(time.perf_counter() - orbit_write_start)
+    orbit_weight_spec_path: Path | None = None
+    orbit_weight_spec_write_runtime_sec = 0.0
+    if artifact_dir is not None and (orbit_weighting_enabled or orbit_weight_spec.source != "uniform"):
+        orbit_weight_write_start = time.perf_counter()
+        orbit_weight_spec_path = write_orbit_weight_spec(
+            Path(artifact_dir) / "orbit_weight_spec.json", orbit_weight_spec
+        )
+        orbit_weight_spec_write_runtime_sec = float(time.perf_counter() - orbit_weight_write_start)
     total_runtime_including_artifact_writes_sec = float(time.perf_counter() - start)
     if use_native_fused_state:
         final_active_array = np.asarray(
@@ -1624,6 +1644,10 @@ def relshift_prune(
             "requested_relshift_engine": requested_relshift_engine,
             "incremental_backend": "native_cpp_extension" if relshift_engine == "incremental_sequential_exact" else "",
             "score_norm": score_norm,
+            "orbit_weighting_enabled": orbit_weighting_enabled,
+            "orbit_weight_spec": orbit_weight_spec.as_dict(),
+            "orbit_weight_spec_path": str(orbit_weight_spec_path) if orbit_weight_spec_path else None,
+            "orbit_weight_spec_write_runtime_sec": orbit_weight_spec_write_runtime_sec,
             "score_scalarization_kernel": "canonical_native_raw_log1p_v1",
             "score_node_scope": "edge_endpoints_only",
             "round_state_update_mode": "single_edge_exact_incremental" if relshift_engine == "incremental_sequential_exact" else "union_two_hop_exact_local_recount",
